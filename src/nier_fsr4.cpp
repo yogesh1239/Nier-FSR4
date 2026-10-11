@@ -151,9 +151,9 @@ void LoadConfig()
     const wchar_t* f = ini.c_str();
     wchar_t buf[64];
     GetPrivateProfileStringW(L"FSR", L"Version", L"4.1.1", buf, 64, f);
-    char nb[64];
-    WideCharToMultiByte(CP_UTF8, 0, buf, -1, nb, 64, nullptr, nullptr);
-    g_cfg.version = nb;
+    char nb[64] = {};
+    if (WideCharToMultiByte(CP_UTF8, 0, buf, -1, nb, sizeof nb, nullptr, nullptr) > 0)
+        g_cfg.version = nb;
     g_cfg.sharpening = GetPrivateProfileIntW(L"FSR", L"Sharpening", 0, f) != 0;
     g_cfg.sharpness = std::clamp(IniFloat(f, L"FSR", L"Sharpness", 0.0f), 0.0f, 1.0f);
     g_cfg.jitterSignX = IniFloat(f, L"FSR", L"JitterSignX", 1.0f) < 0 ? -1.0f : 1.0f;
@@ -189,6 +189,8 @@ void LoadConfig()
 constexpr uint32_t kRvaDepthNear = 0xabc1c;
 constexpr uint32_t kRvaDepthRange = 0xabecc;
 constexpr uint32_t kRvaProjP11 = 0xabe8c;
+constexpr uint32_t kRvaProjP22 = 0xabea0;  // same projection copy (0x180015797)
+constexpr uint32_t kRvaProjP23 = 0xabea4;
 constexpr uint32_t kModSizeOfImage = 0xd1000;
 
 const uint8_t* g_modBase;
@@ -231,6 +233,24 @@ CameraInfo GetCamera()
         {
             c.nearZ = n;
             c.farZ = n + r;
+        }
+        else
+        {
+            // No depth constants accepted yet: derive them from the projection
+            // the same way the mod does (0x180018ac4): near = P23 / P22,
+            // far = P23 / (P22 + 1).
+            float p22, p23;
+            memcpy(&p22, g_modBase + kRvaProjP22, 4);
+            memcpy(&p23, g_modBase + kRvaProjP23, 4);
+            if (std::isfinite(p22) && std::isfinite(p23) && p22 != 0.0f && p22 + 1.0f != 0.0f)
+            {
+                float pn = p23 / p22, pf = p23 / (p22 + 1.0f);
+                if (std::isfinite(pn) && std::isfinite(pf) && pn > 0.0f && pf > pn)
+                {
+                    c.nearZ = pn;
+                    c.farZ = pf;
+                }
+            }
         }
         if (std::isfinite(p11) && std::fabs(p11) > 0.05f && std::fabs(p11) < 50.0f)
             c.fovY = 2.0f * std::atan(1.0f / std::fabs(p11));
@@ -785,7 +805,7 @@ bool Feature::CreateContext()
         f |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
     if (inverted)
         f |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-    if (g_cfg.depthInfinite)
+    if (g_cfg.depthInfinite > 0)  // only 1 turns it on; 0 and -1 mean off
         f |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     if (autoExp)
         f |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;

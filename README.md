@@ -66,7 +66,7 @@ Logs go to `NIER_FSR4.log` (FSR side) and `NIER_DLAA.log` (mod side).
 
 This was built and checked on Linux with MinGW (exports, vtable layout, patch disassembly and a Wine
 smoke test of the NGX entry points). It has **not been run in the game on Radeon hardware yet**. The first
-in-game run should check `NIER_FSR4.log` for `provider FSR 4.1.1` and for the evaluate lines.
+in-game run should check `NIER_FSR4.log` for `provider 4.1.1` and for the evaluate lines.
 
 How the mod was taken apart is in [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md).
 
