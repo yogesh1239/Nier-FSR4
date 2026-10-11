@@ -89,11 +89,9 @@ bool NgxParams::Lookup(const char* name, Value* out) const
 
 bool NgxParams::GetPointer(const char* name, void** out) const
 {
-    std::lock_guard<std::mutex> g(m_lock);
-    auto it = m_values.find(name ? name : "");
-    if (it == m_values.end())
+    Value v;
+    if (!Lookup(name, &v))
         return false;
-    const Value& v = it->second;
     switch (v.type)
     {
     case Type::D3D11:

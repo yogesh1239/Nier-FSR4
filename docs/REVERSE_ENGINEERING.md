@@ -106,8 +106,8 @@ FSR 4 only ships a DX12 backend. `NIER_FSR4.dll` works like this:
 3. Create shared committed textures (`D3D12_HEAP_FLAG_SHARED`) for colour, depth, motion vectors and
    output (output gets UAV), and open them in D3D11 (`OpenSharedResource1`).
 4. Every frame:
-   - D3D11 `CopyResource` × 3, then `Signal`
+   - D3D11 `CopySubresourceRegion` × 3 (subresource 0, so sources with mips or array slices work), then `Signal`
    - D3D12 `Wait`, `ffxDispatch`, `Signal`
-   - D3D11 `Wait`, then `CopyResource` into the mod's output
+   - D3D11 `Wait`, then `CopySubresourceRegion` into subresource 0 of the mod's output
 
 Three command allocators rotate, so the CPU never waits on the frame it just submitted.

@@ -659,6 +659,8 @@ void Bridge::Shutdown()
     for (auto& f : allocFence)
         f = 0;
     lost = false;
+    providerChosen = false;
+    provider = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +684,11 @@ struct Feature
     // Allocated per feature and never freed (4 bytes each), so a stale handle
     // can never compare equal to a later feature's.
     NVSDK_NGX_Handle* handle = new NVSDK_NGX_Handle{};
+    ~Feature()
+    {
+        if (handle && handle->Id == 0)  // never handed out, safe to free
+            delete handle;
+    }
     uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
     int dlssFlags = 0;
     ffxContext ctx = nullptr;
@@ -697,6 +704,31 @@ struct Feature
 
 std::mutex g_lock;
 Feature* g_feature;
+
+struct CreateRequest
+{
+    uint32_t w = 0, h = 0, outW = 0, outH = 0;
+    int flags = 0;
+    bool operator==(const CreateRequest& o) const
+    {
+        return w == o.w && h == o.h && outW == o.outW && outH == o.outH && flags == o.flags;
+    }
+};
+
+// The last CreateFeature that failed; cleared on success and on a bridge rebuild.
+struct FailedCreate : CreateRequest
+{
+    bool valid = false;
+    NVSDK_NGX_Result result = NGX_Fail;
+    NVSDK_NGX_Result Remember(const CreateRequest& r, NVSDK_NGX_Result res)
+    {
+        static_cast<CreateRequest&>(*this) = r;
+        valid = true;
+        result = res;
+        return res;
+    }
+    bool operator==(const CreateRequest& o) const { return CreateRequest::operator==(o); }
+} g_failedCreate;
 
 void DestroyFeature()
 {
@@ -751,7 +783,6 @@ bool Feature::CreateContext()
     // hardware the SDK only offers FSR 3.1.x.
     if (!g_bridge.providerChosen)
     {
-        g_bridge.providerChosen = true;
         uint64_t count = 0;
         ffxQueryDescGetVersions q{};
         q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
@@ -765,6 +796,7 @@ bool Feature::CreateContext()
         q.versionNames = names.data();
         if (count && g_ffx.Query(nullptr, &q.header) == FFX_API_RETURN_OK)
         {
+            g_bridge.providerChosen = true;
             std::string want = Lower(g_cfg.version);
             for (uint64_t i = 0; i < count; ++i)
             {
@@ -870,6 +902,17 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     Bridge& b = g_bridge;
     if (!b.ready || b.lost)
         return NGX_FailNotInitialized;
+    {
+        ID3D11Device* owner = nullptr;
+        ctx->GetDevice(&owner);
+        bool same = owner == b.dev11;
+        SafeRelease(owner);
+        if (!same)
+        {
+            LogRepeat("evaluate: the context belongs to a different D3D11 device than NGX Init was given");
+            return NGX_FailNotInitialized;
+        }
+    }
     if (!b.Ensure(b.color, color, false, "colour") || !b.Ensure(b.depth, depth, false, "depth") ||
         !b.Ensure(b.mv, mvs, false, "motion vector") || !b.Ensure(b.output, output, true, "output"))
         return NGX_Fail;
@@ -1007,6 +1050,7 @@ NVSDK_NGX_Result InitCommon(ID3D11Device* device, const char* who, void* caller)
         DestroyFeature();  // its FSR context lives on the old D3D12 device
         g_bridge.Shutdown();
     }
+    g_failedCreate.valid = false;
     Log("mod camera data: %s", g_modBase ? "found (NIER_DLAA 1.1)" : "not found, using [Camera] values");
     if (!g_bridge.Init(device))
         return NGX_FailFeatureNotSupported;
@@ -1060,6 +1104,7 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown()
     DestroyFeature();
     g_bridge.Shutdown();
     g_bridge.failedAt = 0;
+    g_failedCreate.valid = false;
     return NGX_Success;
 }
 
@@ -1127,29 +1172,39 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext* ctx,
     if (!g_bridge.ready || g_bridge.lost)
         return NGX_FailNotInitialized;
 
-    auto* ft = new Feature();
-    ft->handle->Id = g_nextHandle++;
-    ft->renderW = ft->createW = (uint32_t)p->I64("Width", 0);
-    ft->renderH = ft->createH = (uint32_t)p->I64("Height", 0);
-    ft->outW = (uint32_t)p->I64("OutWidth", ft->renderW);
-    ft->outH = (uint32_t)p->I64("OutHeight", ft->renderH);
-    ft->dlssFlags = (int)p->I64("DLSS.Feature.Create.Flags", 0);
-    Log("CreateFeature: %ux%u -> %ux%u, quality %d, DLSS flags 0x%X", ft->renderW, ft->renderH, ft->outW, ft->outH,
-        (int)p->I64("PerfQualityValue", -1), ft->dlssFlags);
-    if (!ft->renderW || !ft->renderH || !ft->outW || !ft->outH)
-    {
-        delete ft;
-        return NGX_FailInvalidParameter;
-    }
+    CreateRequest req;
+    req.w = (uint32_t)p->I64("Width", 0);
+    req.h = (uint32_t)p->I64("Height", 0);
+    req.outW = (uint32_t)p->I64("OutWidth", req.w);
+    req.outH = (uint32_t)p->I64("OutHeight", req.h);
+    req.flags = (int)p->I64("DLSS.Feature.Create.Flags", 0);
+    // After a failed CreateFeature the mod asks again on every frame
+    // (0x18001882b clears its handle, 0x1800186f9 recreates). Answer an
+    // unchanged request from memory instead of retrying FSR each time.
+    if (g_failedCreate.valid && g_failedCreate == req)
+        return g_failedCreate.result;
+    Log("CreateFeature: %ux%u -> %ux%u, quality %d, DLSS flags 0x%X", req.w, req.h, req.outW, req.outH,
+        (int)p->I64("PerfQualityValue", -1), req.flags);
+    if (!req.w || !req.h || !req.outW || !req.outH)
+        return g_failedCreate.Remember(req, NGX_FailInvalidParameter);
+
     // Free the previous context first so two sets of FSR resources never
     // coexist. The mod releases its old handle before every CreateFeature
     // (0x18001871b), so nothing still uses the feature dropped here.
     DestroyFeature();
+    auto* ft = new Feature();
+    ft->renderW = ft->createW = req.w;
+    ft->renderH = ft->createH = req.h;
+    ft->outW = req.outW;
+    ft->outH = req.outH;
+    ft->dlssFlags = req.flags;
     if (!ft->CreateContext())
     {
-        delete ft;
-        return NGX_Fail;
+        delete ft;  // its handle was never handed out
+        return g_failedCreate.Remember(req, NGX_Fail);
     }
+    g_failedCreate.valid = false;
+    ft->handle->Id = g_nextHandle++;
     g_feature = ft;
     *handle = ft->handle;
     return NGX_Success;
