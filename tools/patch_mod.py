@@ -13,8 +13,10 @@ The patch replaces the body of NGXLoadCoreLibrary with
     jmp  qword ptr [rip + IAT]      ; LoadLibraryW (IAT slot RVA 0x4f020)
   name: dw 'NIER_FSR4.dll', 0
 
-so the NGX entry points resolve to NIER_FSR4.dll's exports. Nothing else in
-the mod changes.
+so the NGX entry points resolve to NIER_FSR4.dll's exports. The function's
+unwind info (UNWIND_INFO at RVA 0x662f0, used only by this function's .pdata
+entry) is rewritten to "no prolog, no handler" so stack walks through the
+stub stay correct. Nothing else in the mod changes.
 
 Usage: patch_mod.py <original d3d11.dll> <output d3d11.dll>
 Only uses the Python standard library.
@@ -29,6 +31,10 @@ RVA_IAT_LOADLIBRARYW = 0x4F020
 # mov rax, rsp / push rbp / push r14 / push r15 / lea rbp, [rax - 0x198]
 EXPECTED_PROLOGUE = bytes.fromhex("488bc45541564157488da868feffff")
 DLL_NAME = "NIER_FSR4.dll"
+RVA_UNWIND_INFO = 0x662F0
+# v1 | EHANDLER|UHANDLER, 0x3c-byte prolog, 11 unwind codes, no frame register
+EXPECTED_UNWIND_HEADER = bytes.fromhex("193c0b00")
+STUB_UNWIND_HEADER = bytes.fromhex("01000000")  # v1, no handler, no prolog, no codes
 
 
 def rva_to_offset(data, rva):
@@ -75,8 +81,14 @@ def main():
         print("error: IAT slot is not LoadLibraryW")
         return 1
 
+    uw = rva_to_offset(data, RVA_UNWIND_INFO)
+    if data[uw:uw + 4] != EXPECTED_UNWIND_HEADER:
+        print("error: unwind info of NGXLoadCoreLibrary does not match")
+        return 1
+
     stub = build_stub()
     data[off:off + len(stub)] = stub
+    data[uw:uw + 4] = STUB_UNWIND_HEADER
     open(sys.argv[2], "wb").write(data)
     print(f"patched NGXLoadCoreLibrary at RVA {RVA_LOAD_CORE:#x} ({len(stub)} bytes): loads {DLL_NAME}")
     print(f"output sha256 {hashlib.sha256(data).hexdigest()}")

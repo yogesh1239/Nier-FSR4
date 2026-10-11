@@ -1,6 +1,6 @@
 // Wine/Windows smoke test: drives NIER_FSR4.dll the way the mod's MSVC code
 // does (raw vtable offsets), and checks the patched NGXLoadCoreLibrary stub.
-//   smoke.exe <dir with NIER_FSR4.dll> [patched d3d11.dll]
+//   smoke.exe <dir of smoke.exe, holding NIER_FSR4.dll> [patched d3d11.dll]
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -11,12 +11,57 @@ static int fails;
 
 template <class F> F Slot(void* obj, int off) { return *(F*)(*(char**)obj + off); }
 
+// Loads the patched mod normally (the Windows loader binds its IAT and runs
+// its DllMain) before NIER_FSR4.dll is loaded, calls the patched
+// NGXLoadCoreLibrary (RVA 0x229a0) and checks that it loaded NIER_FSR4.dll
+// from `dir` through LoadLibraryW's normal search. Also checks that a stack
+// walk stopped on the stub's jmp (RVA 0x229a7) unwinds to the caller.
+static HMODULE StubTest(const char* modPath, const char* dir)
+{
+    HMODULE mod = LoadLibraryA(modPath);
+    CHECK(mod != nullptr);
+    if (!mod)
+        return nullptr;
+    char* base = (char*)mod;
+    CHECK(GetModuleHandleA("NIER_FSR4.dll") == nullptr);
+    CHECK(*(void**)(base + 0x4f020) == (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW"));
+
+    HMODULE r = ((HMODULE (*)(void*))(base + 0x229a0))((void*)0x1234);
+    char got[MAX_PATH] = {}, want[MAX_PATH];
+    if (r)
+        GetModuleFileNameA(r, got, MAX_PATH);
+    snprintf(want, sizeof want, "%s\\NIER_FSR4.dll", dir);
+    printf("     stub loaded %s\n", got);
+    CHECK(r != nullptr && lstrcmpiA(got, want) == 0);
+
+    DWORD64 imageBase = 0;
+    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry((DWORD64)(base + 0x229a7), &imageBase, nullptr);
+    CHECK(fn != nullptr);
+    if (fn)
+    {
+        DWORD64 stack[4] = {0x1122334455667788ull, 0, 0, 0};
+        CONTEXT c = {};
+        c.Rip = (DWORD64)(base + 0x229a7);
+        c.Rsp = (DWORD64)stack;
+        void* handlerData = nullptr;
+        DWORD64 frame = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fn, &c, &handlerData, &frame, nullptr);
+        CHECK(c.Rip == 0x1122334455667788ull && c.Rsp == (DWORD64)stack + 8);
+    }
+    return r;
+}
+
 int main(int argc, char** argv)
 {
+    const char* dir = argc > 1 ? argv[1] : ".";
+    HMODULE fromStub = argc > 2 ? StubTest(argv[2], dir) : nullptr;
+
     char path[MAX_PATH];
-    snprintf(path, sizeof path, "%s\\NIER_FSR4.dll", argc > 1 ? argv[1] : ".");
+    snprintf(path, sizeof path, "%s\\NIER_FSR4.dll", dir);
     HMODULE m = LoadLibraryA(path);
     CHECK(m != nullptr);
+    if (argc > 2)
+        CHECK(fromStub == m);
     if (!m) return 1;
     const char* names[] = {"NVSDK_NGX_D3D11_Init", "NVSDK_NGX_D3D11_Init_Ext", "NVSDK_NGX_D3D11_Init_ProjectID",
         "NVSDK_NGX_D3D11_Shutdown", "NVSDK_NGX_D3D11_Shutdown1", "NVSDK_NGX_D3D11_GetParameters",
@@ -60,28 +105,6 @@ int main(int argc, char** argv)
     CHECK(Slot<int (*)(void*, const char*, unsigned*)>(caps, 0x60)(caps, "NotSet", &missing) == (int)0xBAD00010);
     CHECK(Slot<int (*)(void*, const char*, unsigned*)>(caps, 0x60)(caps, "DLSS.Hint.Render.Preset.DLAA", &missing) != 1);
 
-    if (argc > 2)
-    {
-        // Call the patched NGXLoadCoreLibrary (RVA 0x229a0) inside the mod and
-        // check it hands back NIER_FSR4.dll. DONT_RESOLVE_DLL_REFERENCES keeps
-        // the mod's DllMain (hooks) from running; LoadLibraryW is still bound
-        // by hand below because the IAT is not filled in that mode.
-        HMODULE mod = LoadLibraryExA(argv[2], nullptr, DONT_RESOLVE_DLL_REFERENCES);
-        CHECK(mod != nullptr);
-        if (mod)
-        {
-            char* base = (char*)mod;
-            DWORD old;
-            void** iat = (void**)(base + 0x4f020);
-            VirtualProtect(iat, 8, PAGE_READWRITE, &old);
-            *iat = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW");
-            VirtualProtect(base + 0x229a0, 64, PAGE_EXECUTE_READ, &old);
-            SetDllDirectoryA(argc > 1 ? argv[1] : ".");
-            HMODULE r = ((HMODULE (*)(void*))(base + 0x229a0))(nullptr);
-            printf("     stub returned %p, NIER_FSR4.dll is %p\n", (void*)r, (void*)m);
-            CHECK(r == m);
-        }
-    }
     printf(fails ? "SMOKE TEST FAILED (%d)\n" : "SMOKE TEST PASSED\n", fails);
     return fails ? 1 : 0;
 }

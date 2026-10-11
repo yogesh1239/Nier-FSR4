@@ -5,6 +5,10 @@
 #   ./build.sh                              # just the dll
 #   ./build.sh <mod dir> <FidelityFX SDK>   # dll + patched mod + FSR binaries in out/package
 set -euo pipefail
+# Resolve the arguments against the caller's directory before changing to the repo.
+ARGS=()
+for a in "$@"; do ARGS+=("$(realpath "$a")"); done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 cd "$(dirname "$0")"
 
 CXX=${CXX:-x86_64-w64-mingw32-g++}
@@ -18,8 +22,8 @@ if [[ $# -ge 2 ]]; then
     MOD=$1
     SDK=$2
     # The DLLs must come from the same SDK release as third_party/FidelityFX.
-    if [[ -d "$SDK/.git" ]] && ! git -C "$SDK" describe --tags --exact-match 2>/dev/null | grep -qx v2.3.0; then
-        echo "warning: $SDK is not the v2.3.0 tag the headers were taken from" >&2
+    if ! git -C "$SDK" describe --tags --exact-match 2>/dev/null | grep -qx v2.3.0; then
+        echo "warning: cannot confirm $SDK is the v2.3.0 tag the headers were taken from" >&2
     fi
     PKG=out/package
     rm -rf "$PKG"
