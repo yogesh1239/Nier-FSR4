@@ -74,13 +74,10 @@ void* const NgxParamsVtbl::table[17] = {
 
 NgxParams::NgxParams() : m_vtbl(NgxParamsVtbl::table) {}
 
-NgxParams::Value& NgxParams::Put(const char* name, Type t)
+void NgxParams::Put(const char* name, const Value& v)
 {
     std::lock_guard<std::mutex> g(m_lock);
-    Value& v = m_values[name ? name : ""];
-    v.type = t;
-    v.u64 = 0;
-    return v;
+    m_values[name ? name : ""] = v;
 }
 
 bool NgxParams::GetNumber(const char* name, double* out) const

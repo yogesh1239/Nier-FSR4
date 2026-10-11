@@ -49,7 +49,6 @@ namespace
 // Logging and configuration
 // ---------------------------------------------------------------------------
 
-HMODULE g_self;
 std::wstring g_dir;
 FILE* g_log;
 std::mutex g_logLock;
@@ -72,6 +71,47 @@ void Log(const char* fmt, ...)
     va_end(a);
     fputc('\n', g_log);
     fflush(g_log);
+}
+
+// For errors that can repeat every frame. Keyed by the formatted text: the
+// first 5 of a burst are logged, then every 3600th. A message that has been
+// quiet for 30 s starts a new burst.
+struct RepeatEntry
+{
+    std::string text;
+    unsigned count;
+    ULONGLONG last;
+};
+std::mutex g_repeatLock;
+std::vector<RepeatEntry> g_repeats;
+
+void LogRepeat(const char* fmt, ...)
+{
+    char buf[512];
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(buf, sizeof buf, fmt, a);
+    va_end(a);
+    unsigned n;
+    {
+        std::lock_guard<std::mutex> g(g_repeatLock);
+        ULONGLONG now = GetTickCount64();
+        auto it = std::find_if(g_repeats.begin(), g_repeats.end(), [&](const RepeatEntry& e) { return e.text == buf; });
+        if (it == g_repeats.end())
+        {
+            if (g_repeats.size() >= 64)
+                g_repeats.erase(std::min_element(g_repeats.begin(), g_repeats.end(),
+                                                 [](const RepeatEntry& x, const RepeatEntry& y) { return x.last < y.last; }));
+            it = g_repeats.insert(g_repeats.end(), {buf, 0u, now});
+        }
+        if (now - it->last > 30000)
+            it->count = 0;
+        it->last = now;
+        n = ++it->count;
+    }
+    if (n > 5 && n % 3600 != 0)
+        return;
+    Log(n == 5 ? "%s (repeating, now logged every 3600th time)" : n > 5 ? "%s (x%u)" : "%s", buf, n);
 }
 
 struct Config
@@ -213,7 +253,6 @@ struct Ffx
     HMODULE dll = nullptr;
     PfnFfxCreateContext CreateContext = nullptr;
     PfnFfxDestroyContext DestroyContext = nullptr;
-    PfnFfxConfigure Configure = nullptr;
     PfnFfxQuery Query = nullptr;
     PfnFfxDispatch Dispatch = nullptr;
 
@@ -230,7 +269,6 @@ struct Ffx
         }
         CreateContext = (PfnFfxCreateContext)GetProcAddress(dll, "ffxCreateContext");
         DestroyContext = (PfnFfxDestroyContext)GetProcAddress(dll, "ffxDestroyContext");
-        Configure = (PfnFfxConfigure)GetProcAddress(dll, "ffxConfigure");
         Query = (PfnFfxQuery)GetProcAddress(dll, "ffxQuery");
         Dispatch = (PfnFfxDispatch)GetProcAddress(dll, "ffxDispatch");
         if (!CreateContext || !DestroyContext || !Query || !Dispatch)
@@ -331,22 +369,43 @@ struct Bridge
     HANDLE fenceEvent = nullptr;
 
     SharedTex color, depth, mv, output;
-    bool failed = false;
+    bool ready = false;
+    bool lost = false;       // a device was removed or the GPU hung; stop using the bridge
+    ULONGLONG failedAt = 0;  // last failed creation, retried after 10 s; cleared by NGX Shutdown
 
     bool Init(ID3D11Device* device);
     bool Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* what);
-    void WaitCpu(UINT64 v);
+    bool WaitCpu(UINT64 v);
     void Shutdown();
+
+private:
+    bool Create(ID3D11Device* device);
 } g_bridge;
 
+// Every failure path releases whatever was created, so `ready` is the only
+// state the rest of the code has to look at.
+// The caller (InitCommon) shuts the bridge down first if the device changed,
+// after destroying the FSR context that lives on it.
 bool Bridge::Init(ID3D11Device* device)
 {
-    if (dev12)
+    if (ready)
         return true;
-    if (failed)
+    if (failedAt && GetTickCount64() - failedAt < 10000)
         return false;
-    failed = true;  // cleared on success
+    if (Create(device))
+    {
+        ready = true;
+        failedAt = 0;
+        Log("bridge: D3D12 device ready");
+        return true;
+    }
+    Shutdown();
+    failedAt = GetTickCount64();
+    return false;
+}
 
+bool Bridge::Create(ID3D11Device* device)
+{
     dev11 = device;
     dev11->AddRef();
     if (FAILED(dev11->QueryInterface(__uuidof(ID3D11Device5), (void**)&dev11_5)))
@@ -438,6 +497,11 @@ bool Bridge::Init(ID3D11Device* device)
         return false;
     }
     fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!fenceEvent)
+    {
+        Log("bridge: CreateEvent failed: %lu", GetLastError());
+        return false;
+    }
 
     ID3D11DeviceContext* imm = nullptr;
     dev11->GetImmediateContext(&imm);
@@ -449,17 +513,43 @@ bool Bridge::Init(ID3D11Device* device)
         return false;
     }
 
-    failed = false;
-    Log("bridge: D3D12 device ready");
     return true;
 }
 
-void Bridge::WaitCpu(UINT64 v)
+// Blocks until the D3D12 queue has passed `v`. Returns false, and marks the
+// bridge lost, if either device was removed or the GPU makes no progress for
+// 10 s. Callers must then not reset or release anything the GPU may use.
+bool Bridge::WaitCpu(UINT64 v)
 {
-    if (fence12->GetCompletedValue() < v)
+    if (!fence12 || !fenceEvent)
+        return true;
+    if (lost)
+        return false;
+    ULONGLONG start = GetTickCount64();
+    for (;;)
     {
-        fence12->SetEventOnCompletion(v, fenceEvent);
-        WaitForSingleObject(fenceEvent, 2000);
+        UINT64 done = fence12->GetCompletedValue();
+        if (done == UINT64_MAX || FAILED(dev12->GetDeviceRemovedReason()) ||
+            FAILED(dev11->GetDeviceRemovedReason()))
+        {
+            Log("bridge: device removed (D3D12 0x%08lX, D3D11 0x%08lX), FSR is off until the game re-creates it",
+                (unsigned long)dev12->GetDeviceRemovedReason(), (unsigned long)dev11->GetDeviceRemovedReason());
+            lost = true;
+            return false;
+        }
+        if (done >= v)
+            return true;
+        if (GetTickCount64() - start > 10000)
+        {
+            Log("bridge: the GPU made no progress for 10 s (fence %llu of %llu), FSR is off", (unsigned long long)done,
+                (unsigned long long)v);
+            lost = true;
+            return false;
+        }
+        if (SUCCEEDED(fence12->SetEventOnCompletion(v, fenceEvent)))
+            WaitForSingleObject(fenceEvent, 1000);
+        else
+            Sleep(1);  // poll instead
     }
 }
 
@@ -468,7 +558,7 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     ID3D11Texture2D* tex = nullptr;
     if (!src || FAILED(src->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)))
     {
-        Log("bridge: %s is not a 2D texture", what);
+        LogRepeat("bridge: %s is not a 2D texture", what);
         return false;
     }
     D3D11_TEXTURE2D_DESC sd{};
@@ -479,14 +569,17 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     if (s.t11 && s.w == sd.Width && s.h == sd.Height && s.fmt == fmt && s.uav == uav)
         return true;
 
-    if (!CopyableFormat(sd.Format) || sd.SampleDesc.Count != 1)
+    // sRGB cannot be a UAV, and the mod only uses R11G11B10F / RGBA16F anyway.
+    bool srgbOutput = uav && (fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    if (!CopyableFormat(sd.Format) || sd.SampleDesc.Count != 1 || srgbOutput)
     {
-        Log("bridge: %s has an unsupported layout (format %d, msaa %u)", what, sd.Format, sd.SampleDesc.Count);
+        LogRepeat("bridge: %s has an unsupported layout (format %d, msaa %u)", what, sd.Format, sd.SampleDesc.Count);
         return false;
     }
 
     // Anything still in flight may reference the old texture.
-    WaitCpu(fenceValue);
+    if (!WaitCpu(fenceValue))
+        return false;
     s.Release();
 
     D3D12_HEAP_PROPERTIES hp{};
@@ -505,7 +598,7 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
                                                 __uuidof(ID3D12Resource), (void**)&s.r12);
     if (FAILED(hr))
     {
-        Log("bridge: creating the shared %s texture %ux%u fmt %d failed: 0x%08lX", what, sd.Width, sd.Height, fmt,
+        LogRepeat("bridge: creating the shared %s texture %ux%u fmt %d failed: 0x%08lX", what, sd.Width, sd.Height, fmt,
             (unsigned long)hr);
         return false;
     }
@@ -518,7 +611,7 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     }
     if (FAILED(hr))
     {
-        Log("bridge: opening the shared %s texture in D3D11 failed: 0x%08lX", what, (unsigned long)hr);
+        LogRepeat("bridge: opening the shared %s texture in D3D11 failed: 0x%08lX", what, (unsigned long)hr);
         s.Release();
         return false;
     }
@@ -532,8 +625,15 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
 
 void Bridge::Shutdown()
 {
-    if (dev12)
-        WaitCpu(fenceValue);
+    // After a failed wait the GPU may still hold these objects. Leak them
+    // instead of releasing them under it.
+    if (!WaitCpu(fenceValue))
+    {
+        Log("bridge: shutting down without releasing GPU objects (device lost)");
+        *this = Bridge{};
+        return;
+    }
+    ready = false;
     color.Release();
     depth.Release();
     mv.Release();
@@ -551,7 +651,11 @@ void Bridge::Shutdown()
     if (fenceEvent)
         CloseHandle(fenceEvent);
     fenceEvent = nullptr;
-    failed = false;
+    fenceValue = 0;
+    frame = 0;
+    for (auto& f : allocFence)
+        f = 0;
+    lost = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -575,11 +679,13 @@ struct Feature
     NVSDK_NGX_Handle handle{};
     uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
     int dlssFlags = 0;
-    uint32_t ffxFlags = 0;
     ffxContext ctx = nullptr;
     uint64_t frames = 0;
     LARGE_INTEGER last{};
     bool reported = false;
+    uint32_t createW = 0, createH = 0;  // render size requested by CreateFeature
+    bool createFailed = false;          // CreateContext failed for failedSizes
+    uint32_t failedSizes[4] = {};
 
     bool CreateContext();
     void DestroyContext();
@@ -587,6 +693,16 @@ struct Feature
 
 std::mutex g_lock;
 Feature* g_feature;
+
+void DestroyFeature()
+{
+    if (g_feature)
+    {
+        g_feature->DestroyContext();
+        delete g_feature;
+        g_feature = nullptr;
+    }
+}
 unsigned int g_nextHandle = 1;
 NgxParams* g_capParams;
 
@@ -601,6 +717,8 @@ bool Feature::CreateContext()
 {
     if (ctx)
         return true;
+    if (g_bridge.lost || !g_bridge.ready)
+        return false;
     if (!g_ffx.Load())
         return false;
 
@@ -624,11 +742,11 @@ bool Feature::CreateContext()
         f |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
     if (g_cfg.debugView)
         f |= FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;
-    ffxFlags = f;
 
     // Pick the provider. FSR 4.x needs a Radeon RX 7000 / 9000 GPU; on other
     // hardware the SDK only offers FSR 3.1.x.
     uint64_t chosen = 0;
+    static bool loggedProviders;
     {
         uint64_t count = 0;
         ffxQueryDescGetVersions q{};
@@ -646,14 +764,17 @@ bool Feature::CreateContext()
             std::string want = Lower(g_cfg.version);
             for (uint64_t i = 0; i < count; ++i)
             {
-                Log("FSR: provider available: %s (id 0x%llX)", names[i] ? names[i] : "?", (unsigned long long)ids[i]);
+                if (!loggedProviders)
+                    Log("FSR: provider available: %s (id 0x%llX)", names[i] ? names[i] : "?",
+                        (unsigned long long)ids[i]);
                 if (!chosen && want != "auto" && !want.empty() && names[i] &&
                     Lower(names[i]).find(want) != std::string::npos)
                     chosen = ids[i];
             }
-            if (!chosen && want != "auto")
+            if (!chosen && want != "auto" && !loggedProviders)
                 Log("FSR: no provider matches Version=%s, using the SDK default (FSR 4 needs an RX 7000/9000 GPU)",
                     g_cfg.version.c_str());
+            loggedProviders = true;
         }
     }
 
@@ -682,8 +803,13 @@ bool Feature::CreateContext()
     ffxReturnCode_t rc = g_ffx.CreateContext(&ctx, &desc.header, nullptr);
     if (rc != FFX_API_RETURN_OK)
     {
-        Log("FSR: ffxCreateContext failed: %u", rc);
+        LogRepeat("FSR: ffxCreateContext failed: %u (render %ux%u, output %ux%u)", rc, renderW, renderH, outW, outH);
         ctx = nullptr;
+        createFailed = true;
+        failedSizes[0] = renderW;
+        failedSizes[1] = renderH;
+        failedSizes[2] = outW;
+        failedSizes[3] = outH;
         return false;
     }
 
@@ -699,8 +825,9 @@ void Feature::DestroyContext()
 {
     if (ctx)
     {
-        g_bridge.WaitCpu(g_bridge.fenceValue);
-        g_ffx.DestroyContext(&ctx, nullptr);
+        // If the GPU may still be using the context's resources, leak them.
+        if (g_bridge.WaitCpu(g_bridge.fenceValue))
+            g_ffx.DestroyContext(&ctx, nullptr);
         ctx = nullptr;
     }
 }
@@ -729,16 +856,18 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     auto* mvs = (ID3D11Resource*)p.P("MotionVectors");
     if (!color || !output || !depth || !mvs)
     {
-        Log("evaluate: missing input (color %p output %p depth %p mv %p)", color, output, depth, mvs);
+        LogRepeat("evaluate: missing input (color %p output %p depth %p mv %p)", color, output, depth, mvs);
         return NGX_FailInvalidParameter;
     }
     if (ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
     {
-        Log("evaluate: called on a deferred context, not supported");
+        LogRepeat("evaluate: called on a deferred context, not supported");
         return NGX_FailInvalidParameter;
     }
 
     Bridge& b = g_bridge;
+    if (!b.ready || b.lost)
+        return NGX_FailNotInitialized;
     if (!b.Ensure(b.color, color, false, "colour") || !b.Ensure(b.depth, depth, false, "depth") ||
         !b.Ensure(b.mv, mvs, false, "motion vector") || !b.Ensure(b.output, output, true, "output"))
         return NGX_Fail;
@@ -753,8 +882,27 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     rw = std::min(rw, b.color.w);
     rh = std::min(rh, b.color.h);
 
-    if (!ft.CreateContext())
-        return NGX_Fail;
+    // The FSR context is sized at creation. If the textures outgrew it (or the
+    // output size changed without a new CreateFeature), rebuild it.
+    bool resized = rw > ft.renderW || rh > ft.renderH || b.output.w != ft.outW || b.output.h != ft.outH;
+    if (!ft.ctx || resized)
+    {
+        uint32_t want[4] = {std::max(ft.createW, rw), std::max(ft.createH, rh), b.output.w, b.output.h};
+        if (!ft.ctx && ft.createFailed && memcmp(want, ft.failedSizes, sizeof want) == 0)
+            return NGX_Fail;  // already failed at these sizes; retry only when something changes
+        if (ft.ctx)
+            Log("evaluate: size changed (render %ux%u, output %ux%u), rebuilding the FSR context", rw, rh, b.output.w,
+                b.output.h);
+        ft.DestroyContext();
+        ft.renderW = want[0];
+        ft.renderH = want[1];
+        ft.outW = want[2];
+        ft.outH = want[3];
+        ft.frames = 0;
+        ft.createFailed = false;
+        if (!ft.CreateContext())
+            return NGX_Fail;
+    }
 
     LARGE_INTEGER now, freq;
     QueryPerformanceCounter(&now);
@@ -776,7 +924,11 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     // 2. FSR on the D3D12 queue
     int slot = b.frame;
     b.frame = (b.frame + 1) % Bridge::kFrames;
-    b.WaitCpu(b.allocFence[slot]);
+    if (!b.WaitCpu(b.allocFence[slot]))
+    {
+        // Leave D3D11 unblocked: nothing will signal `ready` from D3D12 now.
+        return NGX_Fail;
+    }
     b.alloc[slot]->Reset();
     b.list->Reset(b.alloc[slot], nullptr);
 
@@ -823,7 +975,7 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     b.ctx11->Wait(b.fence11, done);
     if (rc != FFX_API_RETURN_OK)
     {
-        Log("FSR: ffxDispatch failed: %u", rc);
+        LogRepeat("FSR: ffxDispatch failed: %u", rc);
         return NGX_Fail;
     }
     ctx->CopyResource(output, b.output.t11);
@@ -847,6 +999,12 @@ NVSDK_NGX_Result InitCommon(ID3D11Device* device, const char* who, void* caller)
     if (!device)
         return NGX_FailInvalidParameter;
     g_modBase = FindModBase(caller);
+    if (g_bridge.ready && (g_bridge.dev11 != device || g_bridge.lost))
+    {
+        Log("bridge: %s, rebuilding", g_bridge.lost ? "the previous device was lost" : "the game device changed");
+        DestroyFeature();  // its FSR context lives on the old D3D12 device
+        g_bridge.Shutdown();
+    }
     Log("mod camera data: %s", g_modBase ? "found (NIER_DLAA 1.1)" : "not found, using [Camera] values");
     if (!g_bridge.Init(device))
         return NGX_FailFeatureNotSupported;
@@ -897,13 +1055,9 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown()
 {
     std::lock_guard<std::mutex> g(g_lock);
     Log("shutdown");
-    if (g_feature)
-    {
-        g_feature->DestroyContext();
-        delete g_feature;
-        g_feature = nullptr;
-    }
+    DestroyFeature();
     g_bridge.Shutdown();
+    g_bridge.failedAt = 0;
     return NGX_Success;
 }
 
@@ -968,27 +1122,31 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext* ctx,
         Log("CreateFeature: feature %d is not supported", feature);
         return NGX_FailFeatureNotSupported;
     }
-    if (!g_bridge.dev12)
+    if (!g_bridge.ready || g_bridge.lost)
         return NGX_FailNotInitialized;
 
     auto* ft = new Feature();
     ft->handle.Id = g_nextHandle++;
-    ft->renderW = (uint32_t)p->I64("Width", 0);
-    ft->renderH = (uint32_t)p->I64("Height", 0);
+    ft->renderW = ft->createW = (uint32_t)p->I64("Width", 0);
+    ft->renderH = ft->createH = (uint32_t)p->I64("Height", 0);
     ft->outW = (uint32_t)p->I64("OutWidth", ft->renderW);
     ft->outH = (uint32_t)p->I64("OutHeight", ft->renderH);
     ft->dlssFlags = (int)p->I64("DLSS.Feature.Create.Flags", 0);
     Log("CreateFeature: %ux%u -> %ux%u, quality %d, DLSS flags 0x%X", ft->renderW, ft->renderH, ft->outW, ft->outH,
         (int)p->I64("PerfQualityValue", -1), ft->dlssFlags);
-    if (!ft->renderW || !ft->renderH || !ft->CreateContext())
+    if (!ft->renderW || !ft->renderH || !ft->outW || !ft->outH)
+    {
+        delete ft;
+        return NGX_FailInvalidParameter;
+    }
+    // Free the previous context first so two sets of FSR resources never
+    // coexist. If the new one then fails, the caller gets an error and makes a
+    // new CreateFeature call, as it would with DLSS.
+    DestroyFeature();
+    if (!ft->CreateContext())
     {
         delete ft;
         return NGX_Fail;
-    }
-    if (g_feature)
-    {
-        g_feature->DestroyContext();
-        delete g_feature;
     }
     g_feature = ft;
     *handle = &ft->handle;
@@ -1012,9 +1170,7 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* handle
     if (g_feature && &g_feature->handle == handle)
     {
         Log("ReleaseFeature: %u", handle->Id);
-        g_feature->DestroyContext();
-        delete g_feature;
-        g_feature = nullptr;
+        DestroyFeature();
     }
     return NGX_Success;
 }
@@ -1023,7 +1179,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
-        g_self = inst;
         DisableThreadLibraryCalls(inst);
         wchar_t path[MAX_PATH];
         DWORD n = GetModuleFileNameW(inst, path, MAX_PATH);

@@ -51,12 +51,12 @@ public:
     NgxParams();
 
     // Typed accessors used by the shim itself.
-    void SetU64(const char* name, uint64_t v) { Put(name, Type::U64).u64 = v; }
-    void SetF32(const char* name, float v) { Put(name, Type::F32).f32 = v; }
-    void SetF64(const char* name, double v) { Put(name, Type::F64).f64 = v; }
-    void SetU32(const char* name, uint32_t v) { Put(name, Type::U32).u32 = v; }
-    void SetI32(const char* name, int32_t v) { Put(name, Type::I32).i32 = v; }
-    void SetPtr(const char* name, void* v, Type t) { Put(name, t).ptr = v; }
+    void SetU64(const char* name, uint64_t v) { Value x{Type::U64, {}}; x.u64 = v; Put(name, x); }
+    void SetF32(const char* name, float v) { Value x{Type::F32, {}}; x.f32 = v; Put(name, x); }
+    void SetF64(const char* name, double v) { Value x{Type::F64, {}}; x.f64 = v; Put(name, x); }
+    void SetU32(const char* name, uint32_t v) { Value x{Type::U32, {}}; x.u32 = v; Put(name, x); }
+    void SetI32(const char* name, int32_t v) { Value x{Type::I32, {}}; x.i32 = v; Put(name, x); }
+    void SetPtr(const char* name, void* v, Type t) { Value x{t, {}}; x.ptr = v; Put(name, x); }
 
     bool GetNumber(const char* name, double* out) const;
     bool GetPointer(const char* name, void** out) const;
@@ -80,7 +80,8 @@ public:
     void Clear();
 
 private:
-    Value& Put(const char* name, Type t);
+    // Stores the whole value under the lock, so readers never see a half-written entry.
+    void Put(const char* name, const Value& v);
 
     // Must stay the first member: the mod reads the vtable pointer at offset 0.
     void* const* m_vtbl;
