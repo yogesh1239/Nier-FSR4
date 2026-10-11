@@ -394,6 +394,7 @@ struct Bridge
     bool hung = false;       // lost without device removal: GPU work may still run, leak instead of release
     bool providerChosen = false;  // FSR provider query done for this device
     uint64_t provider = 0;        // version id to request, 0 = SDK default
+    std::vector<uint64_t> providerIds;  // every provider for this device, newest first
     ULONGLONG failedAt = 0;  // last failed creation, retried after 10 s; cleared by NGX Shutdown
 
     bool Init(ID3D11Device* device);
@@ -696,6 +697,7 @@ void Bridge::Shutdown()
     hung = false;
     providerChosen = false;
     provider = 0;
+    providerIds.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +834,7 @@ bool Feature::CreateContext()
         if (count && g_ffx.Query(nullptr, &q.header) == FFX_API_RETURN_OK)
         {
             g_bridge.providerChosen = true;
+            g_bridge.providerIds.assign(ids.begin(), ids.begin() + count);
             std::string want = Lower(g_cfg.version);
             for (uint64_t i = 0; i < count; ++i)
             {
@@ -841,11 +844,23 @@ bool Feature::CreateContext()
                     g_bridge.provider = ids[i];
             }
             if (!g_bridge.provider && want != "auto")
-                Log("FSR: no provider matches Version=%s, using the SDK default (FSR 4 needs an RX 7000/9000 GPU)",
+                Log("FSR: no provider matches Version=%s, trying the available ones newest first (FSR 4 needs an RX 7000/9000 GPU)",
                     g_cfg.version.c_str());
         }
     }
-    uint64_t chosen = g_bridge.provider;
+    // Providers to try in order: the requested one, then every other one
+    // newest first (e.g. 4.1.1 -> 3.1.5 -> 2.3.4). The SDK does not fall back
+    // by itself, and without an override it would pick the newest provider
+    // again, so each fallback is requested explicitly. 0 = SDK default, used
+    // only when the version query gave nothing.
+    std::vector<uint64_t> candidates;
+    if (g_bridge.provider)
+        candidates.push_back(g_bridge.provider);
+    for (uint64_t id : g_bridge.providerIds)
+        if (id != g_bridge.provider)
+            candidates.push_back(id);
+    if (candidates.empty())
+        candidates.push_back(0);
 
     ffxCreateBackendDX12Desc backend{};
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
@@ -853,8 +868,6 @@ bool Feature::CreateContext()
 
     ffxOverrideVersion over{};
     over.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-    over.versionId = chosen;
-    backend.header.pNext = chosen ? &over.header : nullptr;
 
     ffxCreateContextDescUpscaleVersion ver{};
     ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
@@ -869,16 +882,17 @@ bool Feature::CreateContext()
     desc.maxUpscaleSize = {outW, outH};
     desc.fpMessage = &FfxMessage;
 
-    ffxReturnCode_t rc = g_ffx.CreateContext(&ctx, &desc.header, nullptr);
-    if (rc != FFX_API_RETURN_OK && chosen)
+    ffxReturnCode_t rc = FFX_API_RETURN_ERROR;
+    for (size_t i = 0; i < candidates.size(); ++i)
     {
-        // The pinned provider (FSR 4.1.1) can fail at runtime, e.g. low VRAM or
-        // an old driver. The SDK does not fall back by itself, so retry with
-        // its default provider rather than losing AA altogether.
-        LogRepeat("FSR: the requested provider failed (%u), retrying with the SDK default", rc);
+        over.versionId = candidates[i];
+        backend.header.pNext = candidates[i] ? &over.header : nullptr;
         ctx = nullptr;
-        backend.header.pNext = nullptr;
         rc = g_ffx.CreateContext(&ctx, &desc.header, nullptr);
+        if (rc == FFX_API_RETURN_OK)
+            break;
+        if (i + 1 < candidates.size())
+            LogRepeat("FSR: provider 0x%llX failed (%u), trying the next one", (unsigned long long)candidates[i], rc);
     }
     if (rc != FFX_API_RETURN_OK)
     {
@@ -904,8 +918,10 @@ void Feature::DestroyContext()
 {
     if (ctx)
     {
-        // If the GPU may still be using the context's resources, leak them.
-        if (g_bridge.WaitCpu(g_bridge.fenceValue))
+        // Leak the context only after a hang, when the GPU may still use its
+        // resources. After a device removal nothing runs any more.
+        bool idle = g_bridge.WaitCpu(g_bridge.fenceValue);
+        if (idle || !g_bridge.hung)
             g_ffx.DestroyContext(&ctx, nullptr);
         ctx = nullptr;
     }
