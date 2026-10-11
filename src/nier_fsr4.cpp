@@ -835,6 +835,16 @@ bool Feature::CreateContext()
     desc.fpMessage = &FfxMessage;
 
     ffxReturnCode_t rc = g_ffx.CreateContext(&ctx, &desc.header, nullptr);
+    if (rc != FFX_API_RETURN_OK && chosen)
+    {
+        // The pinned provider (FSR 4.1.1) can fail at runtime, e.g. low VRAM or
+        // an old driver. The SDK does not fall back by itself, so retry with
+        // its default provider rather than losing AA altogether.
+        LogRepeat("FSR: the requested provider failed (%u), retrying with the SDK default", rc);
+        ctx = nullptr;
+        backend.header.pNext = nullptr;
+        rc = g_ffx.CreateContext(&ctx, &desc.header, nullptr);
+    }
     if (rc != FFX_API_RETURN_OK)
     {
         LogRepeat("FSR: ffxCreateContext failed: %u (render %ux%u, output %ux%u)", rc, renderW, renderH, outW, outH);

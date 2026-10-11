@@ -64,8 +64,9 @@ public:
     bool Lookup(const char* name, Value* out) const;
     bool GetPointer(const char* name, void** out) const;
 
-    // Converts a stored number to T like NGX does: integers keep their bit
-    // pattern (int -1 read as unsigned is 0xFFFFFFFF), floats are truncated.
+    // Converts a stored number to T with C++ integer conversion: int -1 read
+    // as unsigned int is 0xFFFFFFFF (as uint64 it is sign-extended). Floats
+    // are truncated.
     template <class T>
     bool GetNumber(const char* name, T* out) const
     {
