@@ -51,7 +51,13 @@ int main(int argc, char** argv)
     Slot<void (*)(void*, const char*, void*)>(caps, 0x10)(caps, "Color", fake);
     void* got = nullptr;
     CHECK(Slot<int (*)(void*, const char*, void**)>(caps, 0x50)(caps, "Color", &got) == 1 && got == fake);
+    // int -1 read back as unsigned keeps its bit pattern, as in NGX
+    Slot<void (*)(void*, const char*, int)>(caps, 0x18)(caps, "Sentinel", -1);
+    unsigned bits = 0;
+    CHECK(Slot<int (*)(void*, const char*, unsigned*)>(caps, 0x60)(caps, "Sentinel", &bits) == 1 && bits == 0xFFFFFFFFu);
+    // a missing parameter reports NVSDK_NGX_Result_FAIL_UnsupportedParameter
     unsigned missing = 7;
+    CHECK(Slot<int (*)(void*, const char*, unsigned*)>(caps, 0x60)(caps, "NotSet", &missing) == (int)0xBAD00010);
     CHECK(Slot<int (*)(void*, const char*, unsigned*)>(caps, 0x60)(caps, "DLSS.Hint.Render.Preset.DLAA", &missing) != 1);
 
     if (argc > 2)

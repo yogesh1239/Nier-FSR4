@@ -17,6 +17,10 @@ echo "built out/NIER_FSR4.dll"
 if [[ $# -ge 2 ]]; then
     MOD=$1
     SDK=$2
+    # The DLLs must come from the same SDK release as third_party/FidelityFX.
+    if [[ -d "$SDK/.git" ]] && ! git -C "$SDK" describe --tags --exact-match 2>/dev/null | grep -qx v2.3.0; then
+        echo "warning: $SDK is not the v2.3.0 tag the headers were taken from" >&2
+    fi
     PKG=out/package
     rm -rf "$PKG"
     mkdir -p "$PKG"

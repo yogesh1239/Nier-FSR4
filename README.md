@@ -42,7 +42,7 @@ the character motion vectors (`ObjectMotion=1`). The mod hides the blur itself.
 
 ```
 sudo apt install mingw-w64            # or any MinGW-w64 g++ on Windows
-git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK sdk
+git clone --depth 1 --branch v2.3.0 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK sdk   # pinned: matches third_party/
 ./build.sh <folder with the extracted NIER_DLAA files> sdk
 # → out/package/ is ready to drop into the game folder
 ```

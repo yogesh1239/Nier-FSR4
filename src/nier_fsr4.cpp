@@ -371,6 +371,8 @@ struct Bridge
     SharedTex color, depth, mv, output;
     bool ready = false;
     bool lost = false;       // a device was removed or the GPU hung; stop using the bridge
+    bool providerChosen = false;  // FSR provider query done for this device
+    uint64_t provider = 0;        // version id to request, 0 = SDK default
     ULONGLONG failedAt = 0;  // last failed creation, retried after 10 s; cleared by NGX Shutdown
 
     bool Init(ID3D11Device* device);
@@ -571,6 +573,7 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
 
     // sRGB cannot be a UAV, and the mod only uses R11G11B10F / RGBA16F anyway.
     bool srgbOutput = uav && (fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    // Mips and array slices are fine: only subresource 0 is copied.
     if (!CopyableFormat(sd.Format) || sd.SampleDesc.Count != 1 || srgbOutput)
     {
         LogRepeat("bridge: %s has an unsupported layout (format %d, msaa %u)", what, sd.Format, sd.SampleDesc.Count);
@@ -676,13 +679,14 @@ struct NVSDK_NGX_Handle
 
 struct Feature
 {
-    NVSDK_NGX_Handle handle{};
+    // Allocated per feature and never freed (4 bytes each), so a stale handle
+    // can never compare equal to a later feature's.
+    NVSDK_NGX_Handle* handle = new NVSDK_NGX_Handle{};
     uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
     int dlssFlags = 0;
     ffxContext ctx = nullptr;
     uint64_t frames = 0;
     LARGE_INTEGER last{};
-    bool reported = false;
     uint32_t createW = 0, createH = 0;  // render size requested by CreateFeature
     bool createFailed = false;          // CreateContext failed for failedSizes
     uint32_t failedSizes[4] = {};
@@ -745,9 +749,9 @@ bool Feature::CreateContext()
 
     // Pick the provider. FSR 4.x needs a Radeon RX 7000 / 9000 GPU; on other
     // hardware the SDK only offers FSR 3.1.x.
-    uint64_t chosen = 0;
-    static bool loggedProviders;
+    if (!g_bridge.providerChosen)
     {
+        g_bridge.providerChosen = true;
         uint64_t count = 0;
         ffxQueryDescGetVersions q{};
         q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
@@ -764,19 +768,17 @@ bool Feature::CreateContext()
             std::string want = Lower(g_cfg.version);
             for (uint64_t i = 0; i < count; ++i)
             {
-                if (!loggedProviders)
-                    Log("FSR: provider available: %s (id 0x%llX)", names[i] ? names[i] : "?",
-                        (unsigned long long)ids[i]);
-                if (!chosen && want != "auto" && !want.empty() && names[i] &&
+                Log("FSR: provider available: %s (id 0x%llX)", names[i] ? names[i] : "?", (unsigned long long)ids[i]);
+                if (!g_bridge.provider && want != "auto" && !want.empty() && names[i] &&
                     Lower(names[i]).find(want) != std::string::npos)
-                    chosen = ids[i];
+                    g_bridge.provider = ids[i];
             }
-            if (!chosen && want != "auto" && !loggedProviders)
+            if (!g_bridge.provider && want != "auto")
                 Log("FSR: no provider matches Version=%s, using the SDK default (FSR 4 needs an RX 7000/9000 GPU)",
                     g_cfg.version.c_str());
-            loggedProviders = true;
         }
     }
+    uint64_t chosen = g_bridge.provider;
 
     ffxCreateBackendDX12Desc backend{};
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
@@ -914,9 +916,10 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     ft.last = now;
 
     // 1. D3D11 -> shared textures
-    ctx->CopyResource(b.color.t11, color);
-    ctx->CopyResource(b.depth.t11, depth);
-    ctx->CopyResource(b.mv.t11, mvs);
+    // Subresource 0 only: the shared textures have one mip and one slice.
+    ctx->CopySubresourceRegion(b.color.t11, 0, 0, 0, 0, color, 0, nullptr);
+    ctx->CopySubresourceRegion(b.depth.t11, 0, 0, 0, 0, depth, 0, nullptr);
+    ctx->CopySubresourceRegion(b.mv.t11, 0, 0, 0, 0, mvs, 0, nullptr);
     UINT64 ready = ++b.fenceValue;
     b.ctx11->Signal(b.fence11, ready);
     ctx->Flush();
@@ -978,11 +981,10 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
         LogRepeat("FSR: ffxDispatch failed: %u", rc);
         return NGX_Fail;
     }
-    ctx->CopyResource(output, b.output.t11);
+    ctx->CopySubresourceRegion(output, 0, 0, 0, 0, b.output.t11, 0, nullptr);
 
-    if (!ft.reported || (ft.frames % 3600) == 0)
+    if (ft.frames % 3600 == 0)
     {
-        ft.reported = true;
         Log("evaluate: frame %llu, render %ux%u -> %ux%u, jitter %.3f %.3f, mv scale %.2f %.2f, reset %d, "
             "near %.4f far %.1f fov %.1f deg, dt %.2f ms",
             (unsigned long long)ft.frames, rw, rh, b.output.w, b.output.h, d.jitterOffset.x, d.jitterOffset.y,
@@ -1126,7 +1128,7 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext* ctx,
         return NGX_FailNotInitialized;
 
     auto* ft = new Feature();
-    ft->handle.Id = g_nextHandle++;
+    ft->handle->Id = g_nextHandle++;
     ft->renderW = ft->createW = (uint32_t)p->I64("Width", 0);
     ft->renderH = ft->createH = (uint32_t)p->I64("Height", 0);
     ft->outW = (uint32_t)p->I64("OutWidth", ft->renderW);
@@ -1140,8 +1142,8 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext* ctx,
         return NGX_FailInvalidParameter;
     }
     // Free the previous context first so two sets of FSR resources never
-    // coexist. If the new one then fails, the caller gets an error and makes a
-    // new CreateFeature call, as it would with DLSS.
+    // coexist. The mod releases its old handle before every CreateFeature
+    // (0x18001871b), so nothing still uses the feature dropped here.
     DestroyFeature();
     if (!ft->CreateContext())
     {
@@ -1149,7 +1151,7 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext* ctx,
         return NGX_Fail;
     }
     g_feature = ft;
-    *handle = &ft->handle;
+    *handle = ft->handle;
     return NGX_Success;
 }
 
@@ -1159,7 +1161,7 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext* ct
     if (!ctx || !handle || !p)
         return NGX_FailInvalidParameter;
     std::lock_guard<std::mutex> g(g_lock);
-    if (!g_feature || &g_feature->handle != handle)
+    if (!g_feature || g_feature->handle != handle)
         return NGX_FailInvalidParameter;
     return Evaluate(ctx, *g_feature, *p);
 }
@@ -1167,7 +1169,7 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext* ct
 NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* handle)
 {
     std::lock_guard<std::mutex> g(g_lock);
-    if (g_feature && &g_feature->handle == handle)
+    if (g_feature && g_feature->handle == handle)
     {
         Log("ReleaseFeature: %u", handle->Id);
         DestroyFeature();

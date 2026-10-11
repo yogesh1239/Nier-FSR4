@@ -1,6 +1,5 @@
 #include "ngx_params.h"
 
-#include <cmath>
 
 // Each entry is a plain function taking `this` first, which matches the
 // Windows x64 calling convention for a virtual member function (this in rcx,
@@ -32,10 +31,8 @@ struct NgxParamsVtbl
     {
         if (!out)
             return NGX_FailInvalidParameter;
-        double d;
-        if (!p->GetNumber(n, &d))
+        if (!p->GetNumber(n, out))
             return NGX_FailUnsupportedParameter;
-        *out = (T)d;
         return NGX_Success;
     }
     static NVSDK_NGX_Result GetPtr(const NgxParams* p, const char* n, void** o) { return GetPtrT(p, n, o); }
@@ -80,22 +77,14 @@ void NgxParams::Put(const char* name, const Value& v)
     m_values[name ? name : ""] = v;
 }
 
-bool NgxParams::GetNumber(const char* name, double* out) const
+bool NgxParams::Lookup(const char* name, Value* out) const
 {
     std::lock_guard<std::mutex> g(m_lock);
     auto it = m_values.find(name ? name : "");
     if (it == m_values.end())
         return false;
-    const Value& v = it->second;
-    switch (v.type)
-    {
-    case Type::U64: *out = (double)v.u64; return true;
-    case Type::F32: *out = v.f32; return true;
-    case Type::F64: *out = v.f64; return true;
-    case Type::U32: *out = v.u32; return true;
-    case Type::I32: *out = v.i32; return true;
-    default: return false;
-    }
+    *out = it->second;
+    return true;
 }
 
 bool NgxParams::GetPointer(const char* name, void** out) const
