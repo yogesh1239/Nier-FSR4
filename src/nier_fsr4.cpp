@@ -371,6 +371,7 @@ struct Bridge
     SharedTex color, depth, mv, output;
     bool ready = false;
     bool lost = false;       // a device was removed or the GPU hung; stop using the bridge
+    bool hung = false;       // lost without device removal: GPU work may still run, leak instead of release
     bool providerChosen = false;  // FSR provider query done for this device
     uint64_t provider = 0;        // version id to request, 0 = SDK default
     ULONGLONG failedAt = 0;  // last failed creation, retried after 10 s; cleared by NGX Shutdown
@@ -378,6 +379,7 @@ struct Bridge
     bool Init(ID3D11Device* device);
     bool Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* what);
     bool WaitCpu(UINT64 v);
+    void Abandon(const char* why, HRESULT hr);
     void Shutdown();
 
 private:
@@ -543,9 +545,7 @@ bool Bridge::WaitCpu(UINT64 v)
             return true;
         if (GetTickCount64() - start > 10000)
         {
-            Log("bridge: the GPU made no progress for 10 s (fence %llu of %llu), FSR is off", (unsigned long long)done,
-                (unsigned long long)v);
-            lost = true;
+            Abandon("the GPU made no progress for 10 s", S_OK);
             return false;
         }
         if (SUCCEEDED(fence12->SetEventOnCompletion(v, fenceEvent)))
@@ -626,13 +626,27 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     return true;
 }
 
+// Gives up on the bridge after a failed or stuck GPU call. Signalling the
+// shared fence to its maximum from the CPU releases every wait already queued
+// on either device, so the game's D3D11 context cannot stay blocked on a
+// value that will never come.
+void Bridge::Abandon(const char* why, HRESULT hr)
+{
+    Log("bridge: %s (0x%08lX), FSR is off", why, (unsigned long)hr);
+    lost = true;
+    hung = true;
+    if (fence12)
+        fence12->Signal(UINT64_MAX);
+}
+
 void Bridge::Shutdown()
 {
-    // After a failed wait the GPU may still hold these objects. Leak them
-    // instead of releasing them under it.
-    if (!WaitCpu(fenceValue))
+    // After a hang the GPU may still run work that uses these objects: leak
+    // them instead of releasing them under it. After a device removal nothing
+    // runs any more, so they are released normally.
+    if (!WaitCpu(fenceValue) && hung)
     {
-        Log("bridge: shutting down without releasing GPU objects (device lost)");
+        Log("bridge: shutting down without releasing GPU objects (GPU hung)");
         *this = Bridge{};
         return;
     }
@@ -659,6 +673,7 @@ void Bridge::Shutdown()
     for (auto& f : allocFence)
         f = 0;
     lost = false;
+    hung = false;
     providerChosen = false;
     provider = 0;
 }
@@ -974,7 +989,12 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     ctx->CopySubresourceRegion(b.depth.t11, 0, 0, 0, 0, depth, 0, nullptr);
     ctx->CopySubresourceRegion(b.mv.t11, 0, 0, 0, 0, mvs, 0, nullptr);
     UINT64 ready = ++b.fenceValue;
-    b.ctx11->Signal(b.fence11, ready);
+    HRESULT hr = b.ctx11->Signal(b.fence11, ready);
+    if (FAILED(hr))
+    {
+        b.Abandon("D3D11 fence signal failed", hr);
+        return NGX_Fail;
+    }
     ctx->Flush();
 
     // 2. FSR on the D3D12 queue
@@ -985,8 +1005,11 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
         // Leave D3D11 unblocked: nothing will signal `ready` from D3D12 now.
         return NGX_Fail;
     }
-    b.alloc[slot]->Reset();
-    b.list->Reset(b.alloc[slot], nullptr);
+    if (FAILED(hr = b.alloc[slot]->Reset()) || FAILED(hr = b.list->Reset(b.alloc[slot], nullptr)))
+    {
+        b.Abandon("command list reset failed", hr);
+        return NGX_Fail;
+    }
 
     CameraInfo cam = GetCamera();
     float pre = p.F32("DLSS.Pre.Exposure", 0.0f);
@@ -1015,20 +1038,38 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     d.viewSpaceToMetersFactor = g_cfg.viewToMeters;
     d.flags = g_cfg.debugView ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0;
 
-    b.queue->Wait(b.fence12, ready);
+    if (FAILED(hr = b.queue->Wait(b.fence12, ready)))
+    {
+        b.list->Close();
+        b.Abandon("D3D12 queue wait failed", hr);
+        return NGX_Fail;
+    }
     ffxReturnCode_t rc = g_ffx.Dispatch(&ft.ctx, &d.header);
-    b.list->Close();
-    if (rc == FFX_API_RETURN_OK)
+    HRESULT closed = b.list->Close();
+    if (rc == FFX_API_RETURN_OK && SUCCEEDED(closed))
     {
         ID3D12CommandList* lists[] = {b.list};
         b.queue->ExecuteCommandLists(1, lists);
     }
     UINT64 done = ++b.fenceValue;
-    b.queue->Signal(b.fence12, done);
     b.allocFence[slot] = done;
+    if (FAILED(hr = b.queue->Signal(b.fence12, done)))
+    {
+        b.Abandon("D3D12 queue signal failed", hr);
+        return NGX_Fail;
+    }
 
     // 3. shared output -> D3D11
-    b.ctx11->Wait(b.fence11, done);
+    if (FAILED(hr = b.ctx11->Wait(b.fence11, done)))
+    {
+        b.Abandon("D3D11 fence wait failed", hr);
+        return NGX_Fail;
+    }
+    if (FAILED(closed))
+    {
+        b.Abandon("closing the command list failed", closed);
+        return NGX_Fail;
+    }
     if (rc != FFX_API_RETURN_OK)
     {
         LogRepeat("FSR: ffxDispatch failed: %u", rc);
@@ -1062,9 +1103,10 @@ NVSDK_NGX_Result InitCommon(ID3D11Device* device, const char* who, void* caller)
     }
     g_failedCreate.valid = false;
     Log("mod camera data: %s", g_modBase ? "found (NIER_DLAA 1.1)" : "not found, using [Camera] values");
-    if (!g_bridge.Init(device))
-        return NGX_FailFeatureNotSupported;
+    // Load FFX first so a missing FSR dll does not leave a D3D12 device behind.
     if (!g_ffx.Load())
+        return NGX_FailFeatureNotSupported;
+    if (!g_bridge.Init(device))
         return NGX_FailFeatureNotSupported;
     return NGX_Success;
 }
