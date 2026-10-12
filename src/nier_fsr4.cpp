@@ -43,6 +43,11 @@
 
 #define NGX_API extern "C" __declspec(dllexport)
 
+// Set by build.sh (-DNIER_FSR4_BUILD="v1.0.N+sha"); "dev" for local builds.
+#ifndef NIER_FSR4_BUILD
+#define NIER_FSR4_BUILD "dev"
+#endif
+
 namespace
 {
 
@@ -53,18 +58,28 @@ namespace
 std::wstring g_dir;
 FILE* g_log;
 std::mutex g_logLock;
+bool g_logRotated;  // guarded by g_logLock
 
 void Log(const char* fmt, ...)
 {
     std::lock_guard<std::mutex> g(g_logLock);
-    if (!g_log)
-    {
-        g_log = _wfopen((g_dir + L"NIER_FSR4.log").c_str(), L"w");
-        if (!g_log)
-            return;
-    }
     SYSTEMTIME t;
     GetLocalTime(&t);
+    if (!g_log)
+    {
+        // Keep the previous session's log as NIER_FSR4.prev.log. Done once per
+        // process, so a failing fopen below does not retry the rename.
+        std::wstring path = g_dir + L"NIER_FSR4.log";
+        if (!g_logRotated)
+        {
+            g_logRotated = true;
+            MoveFileExW(path.c_str(), (g_dir + L"NIER_FSR4.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+        g_log = _wfopen(path.c_str(), L"w");
+        if (!g_log)
+            return;
+        fprintf(g_log, "NIER_FSR4 log, %04u-%02u-%02u\n", t.wYear, t.wMonth, t.wDay);
+    }
     fprintf(g_log, "%02u:%02u:%02u.%03u ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     va_list a;
     va_start(a, fmt);
@@ -113,6 +128,83 @@ void LogRepeat(const char* fmt, ...)
     if (n > 5 && n % 3600 != 0)
         return;
     Log(n == 5 ? "%s (repeating, now logged every 3600th time)" : n > 5 ? "%s (x%u)" : "%s", buf, n);
+}
+
+// Text for an HRESULT, appended to error lines: " (text)" or "" when nothing is
+// known. Caller supplies the buffer, so it is thread safe. Used on error paths only.
+const char* HrText(HRESULT hr, char* buf, size_t n)
+{
+    const char* name = nullptr;
+    switch ((unsigned long)hr)
+    {
+    case 0x887A0005: name = "DXGI_ERROR_DEVICE_REMOVED"; break;
+    case 0x887A0006: name = "DXGI_ERROR_DEVICE_HUNG"; break;
+    case 0x887A0007: name = "DXGI_ERROR_DEVICE_RESET"; break;
+    case 0x887A0020: name = "DXGI_ERROR_DRIVER_INTERNAL_ERROR"; break;
+    case 0x80070057: name = "E_INVALIDARG"; break;
+    case 0x8007000E: name = "E_OUTOFMEMORY"; break;
+    case 0x80004005: name = "E_FAIL"; break;
+    }
+    char msg[128] = {};
+    if (!name)
+    {
+        DWORD len = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, (DWORD)hr, 0, msg,
+                                   sizeof msg - 1, nullptr);
+        while (len && (msg[len - 1] == '\r' || msg[len - 1] == '\n' || msg[len - 1] == '.' || msg[len - 1] == ' '))
+            msg[--len] = 0;
+        if (len)
+            name = msg;
+    }
+    if (n)
+    {
+        if (name)
+            snprintf(buf, n, " (%s)", name);
+        else
+            buf[0] = 0;
+    }
+    return buf;
+}
+
+// Inline form for log arguments: Log("... 0x%08lX%s", hr, HrBuf(hr).s)
+struct HrBuf
+{
+    char s[160];
+    explicit HrBuf(HRESULT hr) { HrText(hr, s, sizeof s); }
+};
+
+const char* FfxName(uint32_t rc)
+{
+    switch (rc)
+    {
+    case FFX_API_RETURN_OK: return "OK";
+    case FFX_API_RETURN_ERROR: return "ERROR";
+    case FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE: return "ERROR_UNKNOWN_DESCTYPE";
+    case FFX_API_RETURN_ERROR_RUNTIME_ERROR: return "ERROR_RUNTIME_ERROR";
+    case FFX_API_RETURN_NO_PROVIDER: return "NO_PROVIDER";
+    case FFX_API_RETURN_ERROR_MEMORY: return "ERROR_MEMORY";
+    case FFX_API_RETURN_ERROR_PARAMETER: return "ERROR_PARAMETER";
+    case FFX_API_RETURN_PROVIDER_NO_SUPPORT_NEW_DESCTYPE: return "PROVIDER_NO_SUPPORT_NEW_DESCTYPE";
+    default: return "?";
+    }
+}
+
+// Process-wide counters, guarded by g_lock. The game usually exits without
+// calling NGX Shutdown and the per-feature frame counter is reset on resize, so
+// the summary is logged whenever a feature is destroyed and on Shutdown (never
+// from DLL_PROCESS_DETACH: the loader lock and CRT state are unreliable there).
+struct Stats
+{
+    unsigned long long evaluated = 0, failed = 0, rebuilds = 0;
+    bool operator==(const Stats& o) const { return evaluated == o.evaluated && failed == o.failed && rebuilds == o.rebuilds; }
+} g_stats, g_statsLogged;
+
+void LogSummary(const char* when)
+{
+    if (g_stats == g_statsLogged || (!g_stats.evaluated && !g_stats.failed && !g_stats.rebuilds))
+        return;
+    g_statsLogged = g_stats;
+    Log("summary (%s): %llu frames evaluated, %llu evaluate failures, %llu context rebuilds since start", when,
+        g_stats.evaluated, g_stats.failed, g_stats.rebuilds);
 }
 
 struct Config
@@ -403,6 +495,7 @@ struct Bridge
     bool providerChosen = false;  // FSR provider query done for this device
     uint64_t provider = 0;        // version id to request, 0 = SDK default
     std::vector<uint64_t> providerIds;  // every provider for this device, newest first
+    int sharedFlagsIdx = 0;  // index of the shared-texture flag set that worked last (0 = plain, 1 = simultaneous access)
     ULONGLONG failedAt = 0;  // last failed creation, retried after 10 s; cleared by NGX Shutdown
 
     bool Init(ID3D11Device* device);
@@ -461,7 +554,14 @@ bool Bridge::Create(ID3D11Device* device)
         DXGI_ADAPTER_DESC d{};
         adapter->GetDesc(&d);
         luid = d.AdapterLuid;
-        Log("bridge: game adapter %ls (vendor 0x%04X device 0x%04X)", d.Description, d.VendorId, d.DeviceId);
+        // Driver version of the adapter the game actually renders on (not adapter 0, which may be an iGPU).
+        char drv[48] = "?";
+        LARGE_INTEGER dv{};
+        if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &dv)))
+            snprintf(drv, sizeof drv, "%u.%u.%u.%u", (unsigned)(dv.HighPart >> 16), (unsigned)(dv.HighPart & 0xFFFF),
+                     (unsigned)(dv.LowPart >> 16), (unsigned)(dv.LowPart & 0xFFFF));
+        Log("bridge: game adapter %ls (vendor 0x%04X device 0x%04X), driver %s, %llu MB dedicated VRAM", d.Description,
+            d.VendorId, d.DeviceId, drv, (unsigned long long)(d.DedicatedVideoMemory >> 20));
         SafeRelease(adapter);
         SafeRelease(dxgiDev);
     }
@@ -484,7 +584,7 @@ bool Bridge::Create(ID3D11Device* device)
     SafeRelease(adapter12);
     if (FAILED(hr))
     {
-        Log("bridge: D3D12CreateDevice failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: D3D12CreateDevice failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
 
@@ -492,7 +592,7 @@ bool Bridge::Create(ID3D11Device* device)
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(hr = dev12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&queue)))
     {
-        Log("bridge: CreateCommandQueue failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: CreateCommandQueue failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     queue->SetName(L"NIER_FSR4 queue");
@@ -500,51 +600,51 @@ bool Bridge::Create(ID3D11Device* device)
         if (FAILED(hr = dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
                                                       (void**)&a)))
         {
-            Log("bridge: CreateCommandAllocator failed: 0x%08lX", (unsigned long)hr);
+            Log("bridge: CreateCommandAllocator failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
             return false;
         }
     if (FAILED(hr = dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0], nullptr,
                                              __uuidof(ID3D12GraphicsCommandList), (void**)&list)))
     {
-        Log("bridge: CreateCommandList failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: CreateCommandList failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     list->Close();
 
     if (FAILED(hr = dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), (void**)&fence12)))
     {
-        Log("bridge: CreateFence failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: CreateFence failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     HANDLE h = nullptr;
     if (FAILED(hr = dev12->CreateSharedHandle(fence12, nullptr, GENERIC_ALL, nullptr, &h)))
     {
-        Log("bridge: sharing the fence failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: sharing the fence failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     hr = dev11_5->OpenSharedFence(h, __uuidof(ID3D11Fence), (void**)&fence11);
     CloseHandle(h);
     if (FAILED(hr))
     {
-        Log("bridge: OpenSharedFence failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: OpenSharedFence failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     if (FAILED(hr = dev11_5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void**)&readyFence11)))
     {
-        Log("bridge: creating the D3D11 fence failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: creating the D3D11 fence failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     h = nullptr;
     if (FAILED(hr = readyFence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &h)))
     {
-        Log("bridge: sharing the D3D11 fence failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: sharing the D3D11 fence failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     hr = dev12->OpenSharedHandle(h, __uuidof(ID3D12Fence), (void**)&readyFence12);
     CloseHandle(h);
     if (FAILED(hr))
     {
-        Log("bridge: opening the D3D11 fence in D3D12 failed: 0x%08lX", (unsigned long)hr);
+        Log("bridge: opening the D3D11 fence in D3D12 failed: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
     fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -560,7 +660,7 @@ bool Bridge::Create(ID3D11Device* device)
     SafeRelease(imm);
     if (FAILED(hr))
     {
-        Log("bridge: ID3D11DeviceContext4 not available: 0x%08lX", (unsigned long)hr);
+        Log("bridge: ID3D11DeviceContext4 not available: 0x%08lX%s", (unsigned long)hr, HrBuf(hr).s);
         return false;
     }
 
@@ -655,35 +755,46 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     D3D12_RESOURCE_FLAGS base = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
     if (rt)
         base |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    // Some drivers also want simultaneous access for cross-API sharing; try that second.
+    // Some drivers also want simultaneous access for cross-API sharing. Start
+    // with the flag set that worked last time (RDNA4 needs index 1, so the
+    // guaranteed-failing plain attempt is skipped on every later resize), then
+    // fall back to the other one.
     const D3D12_RESOURCE_FLAGS attempts[] = {base, base | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS};
+    const int order[2] = {sharedFlagsIdx ? 1 : 0, sharedFlagsIdx ? 0 : 1};
     HRESULT hr = E_FAIL;
-    for (D3D12_RESOURCE_FLAGS flags : attempts)
+    std::string failures;  // one line for the whole texture, not one per attempt
+    for (int idx : order)
     {
+        D3D12_RESOURCE_FLAGS flags = attempts[idx];
         s.Release();
         rd.Flags = flags;
         hr = dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                             __uuidof(ID3D12Resource), (void**)&s.r12);
-        if (FAILED(hr))
-        {
-            LogRepeat("bridge: creating the shared %s texture %ux%u fmt %d flags 0x%x failed: 0x%08lX", what, sd.Width,
-                sd.Height, fmt, (unsigned)flags, (unsigned long)hr);
-            continue;
-        }
-        HANDLE h = nullptr;
-        hr = dev12->CreateSharedHandle(s.r12, nullptr, GENERIC_ALL, nullptr, &h);
+        const char* stage = "create";
         if (SUCCEEDED(hr))
         {
-            hr = dev11_5->OpenSharedResource1(h, __uuidof(ID3D11Texture2D), (void**)&s.t11);
-            CloseHandle(h);
+            HANDLE h = nullptr;
+            hr = dev12->CreateSharedHandle(s.r12, nullptr, GENERIC_ALL, nullptr, &h);
+            if (SUCCEEDED(hr))
+            {
+                hr = dev11_5->OpenSharedResource1(h, __uuidof(ID3D11Texture2D), (void**)&s.t11);
+                CloseHandle(h);
+            }
+            stage = "open in D3D11";
         }
         if (SUCCEEDED(hr))
+        {
+            sharedFlagsIdx = idx;
             break;
-        LogRepeat("bridge: opening the shared %s texture (flags 0x%x) in D3D11 failed: 0x%08lX", what, (unsigned)flags,
-            (unsigned long)hr);
+        }
+        char one[240];
+        snprintf(one, sizeof one, " [%s flags=0x%x hr=0x%08lX%s]", stage, (unsigned)flags, (unsigned long)hr, HrBuf(hr).s);
+        failures += one;
     }
     if (FAILED(hr))
     {
+        LogRepeat("bridge: could not create the shared %s texture %ux%u, game format %d, shared format %d:%s", what,
+            sd.Width, sd.Height, sd.Format, fmt, failures.c_str());
         s.Release();
         return false;
     }
@@ -706,7 +817,7 @@ void Bridge::MarkLost(const char* why, HRESULT hr)
 {
     lost = true;
     hung = !(dev12 && FAILED(dev12->GetDeviceRemovedReason()));
-    Log("bridge: %s (0x%08lX), FSR is off%s", why, (unsigned long)hr,
+    Log("bridge: %s (0x%08lX%s), FSR is off%s", why, (unsigned long)hr, HrBuf(hr).s,
         hung ? "" : " (D3D12 device removed)");
 }
 
@@ -751,6 +862,7 @@ void Bridge::Shutdown()
     providerChosen = false;
     provider = 0;
     providerIds.clear();
+    sharedFlagsIdx = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +936,7 @@ void DestroyFeature()
 {
     if (g_feature)
     {
+        LogSummary("feature destroyed");
         g_feature->DestroyContext();
         delete g_feature;
         g_feature = nullptr;
@@ -949,11 +1062,13 @@ bool Feature::CreateContext()
         if (rc == FFX_API_RETURN_ERROR_MEMORY || FAILED(g_bridge.dev12->GetDeviceRemovedReason()))
             break;
         if (i + 1 < candidates.size())
-            LogRepeat("FSR: provider 0x%llX failed (%u), trying the next one", (unsigned long long)candidates[i], rc);
+            LogRepeat("FSR: provider 0x%llX failed (%u %s), trying the next one", (unsigned long long)candidates[i], rc,
+                      FfxName(rc));
     }
     if (rc != FFX_API_RETURN_OK)
     {
-        LogRepeat("FSR: ffxCreateContext failed: %u (render %ux%u, output %ux%u)", rc, renderW, renderH, outW, outH);
+        LogRepeat("FSR: ffxCreateContext failed: %u %s (render %ux%u, output %ux%u)", rc, FfxName(rc), renderW, renderH, outW,
+                  outH);
         ctx = nullptr;
         createFailed = true;
         failedSizes[0] = renderW;
@@ -1053,6 +1168,8 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
         uint32_t want[4] = {std::max(ft.createW, rw), std::max(ft.createH, rh), b.output.w, b.output.h};
         if (!ft.ctx && ft.createFailed && memcmp(want, ft.failedSizes, sizeof want) == 0)
             return NGX_Fail;  // already failed at these sizes; retry only when something changes
+        if (ft.ctx)
+            ++g_stats.rebuilds;
         if (ft.ctx)
             Log("evaluate: size changed (render %ux%u, output %ux%u), rebuilding the FSR context", rw, rh, b.output.w,
                 b.output.h);
@@ -1165,7 +1282,7 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     }
     if (rc != FFX_API_RETURN_OK)
     {
-        LogRepeat("FSR: ffxDispatch failed: %u", rc);
+        LogRepeat("FSR: ffxDispatch failed: %u %s", rc, FfxName(rc));
         return NGX_Fail;
     }
     ctx->CopySubresourceRegion(output, 0, 0, 0, 0, b.output.t11, 0, nullptr);
@@ -1181,6 +1298,68 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     return NGX_Success;
 }
 
+// Which mod called us, and what else is loaded in the process. Runs once, from
+// InitCommon (outside the loader lock), never from DllMain.
+void LogEnvironmentOnce(void* caller)
+{
+    static bool done;
+    if (done)
+        return;
+    done = true;
+
+    // The mod is identified by the caller's address: GetModuleHandleW(L"d3d11.dll")
+    // could return the system d3d11.dll, which shares the name.
+    HMODULE mod = nullptr;
+    if (caller && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     (LPCWSTR)caller, &mod))
+    {
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(mod, path, MAX_PATH);
+        auto* b = (const uint8_t*)mod;
+        auto* nt = (const IMAGE_NT_HEADERS64*)(b + ((const IMAGE_DOS_HEADER*)mod)->e_lfanew);
+        Log("env: NGX caller module %ls (timestamp 0x%08lX, size of image 0x%lX)", path,
+            (unsigned long)nt->FileHeader.TimeDateStamp, (unsigned long)nt->OptionalHeader.SizeOfImage);
+        if (g_modBase)
+        {
+            // Patched NGXLoadCoreLibrary starts with lea rcx, [rip+x] (48 8D 0D);
+            // the original starts with mov rax, rsp (48 8B C4).
+            const uint8_t* fn = g_modBase + 0x229a0;
+            bool patched = fn[0] == 0x48 && fn[1] == 0x8D && fn[2] == 0x0D;
+            Log("env: NIER_DLAA 1.1 recognised, NGX loader stub %s", patched ? "present (patched)" : "NOT patched (original mod)");
+        }
+        else
+            Log("env: caller is not the NIER_DLAA 1.1 d3d11.dll");
+    }
+    else
+        Log("env: NGX caller module unknown");
+
+    // Other things that hook the same D3D11 / DXGI calls. Fixed list.
+    static const wchar_t* const injectors[] = {L"SpecialK64.dll", L"ReShade64.dll", L"RTSSHooks64.dll",
+                                               L"GameOverlayRenderer64.dll", L"DiscordHook64.dll", L"obs-vulkan64.dll",
+                                               L"graphics-hook64.dll"};
+    for (const wchar_t* n : injectors)
+        if (HMODULE m = GetModuleHandleW(n))
+        {
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(m, path, MAX_PATH);
+            Log("env: loaded: %ls", path);
+        }
+    wchar_t sys[MAX_PATH] = {};
+    UINT sl = GetSystemDirectoryW(sys, MAX_PATH);
+    for (const wchar_t* n : {L"dxgi.dll", L"d3d12.dll"})
+        if (HMODULE m = GetModuleHandleW(n))
+        {
+            wchar_t path[MAX_PATH] = {};
+            DWORD pl = GetModuleFileNameW(m, path, MAX_PATH);
+            if (sl && pl > sl && _wcsnicmp(path, sys, sl) == 0 && path[sl] == L'\\')
+                continue;
+            Log("env: %ls is not the system copy: %ls", n, path);
+        }
+    if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"))
+        if (auto wineVer = (const char*(__cdecl*)())GetProcAddress(ntdll, "wine_get_version"))
+            Log("env: running under Wine/Proton %s", wineVer());
+}
+
 NVSDK_NGX_Result InitCommon(ID3D11Device* device, const char* who, void* caller)
 {
     std::lock_guard<std::mutex> g(g_lock);
@@ -1188,6 +1367,7 @@ NVSDK_NGX_Result InitCommon(ID3D11Device* device, const char* who, void* caller)
     if (!device)
         return NGX_FailInvalidParameter;
     g_modBase = FindModBase(caller);
+    LogEnvironmentOnce(caller);
     if (g_bridge.ready && (g_bridge.dev11 != device || g_bridge.lost))
     {
         Log("bridge: %s, rebuilding", g_bridge.lost ? "the previous device was lost" : "the game device changed");
@@ -1247,6 +1427,7 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown()
     std::lock_guard<std::mutex> g(g_lock);
     Log("shutdown");
     DestroyFeature();
+    LogSummary("shutdown");
     g_bridge.Shutdown();
     g_bridge.failedAt = 0;
     g_failedCreate.valid = false;
@@ -1363,7 +1544,12 @@ NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext* ct
     std::lock_guard<std::mutex> g(g_lock);
     if (!g_feature || g_feature->handle != handle)
         return NGX_FailInvalidParameter;
-    return Evaluate(ctx, *g_feature, *p);
+    NVSDK_NGX_Result r = Evaluate(ctx, *g_feature, *p);
+    if (r == NGX_Success)
+        ++g_stats.evaluated;
+    else
+        ++g_stats.failed;
+    return r;
 }
 
 NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* handle)
@@ -1386,8 +1572,21 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         DWORD n = GetModuleFileNameW(inst, path, MAX_PATH);
         std::wstring p(path, n);
         g_dir = p.substr(0, p.find_last_of(L"\\/") + 1);
-        Log("NIER_FSR4 loaded from %ls (FSR SDK 2.3.0 / FSR %d.%d.%d API)", path, FFX_UPSCALER_VERSION_MAJOR,
-            FFX_UPSCALER_VERSION_MINOR, FFX_UPSCALER_VERSION_PATCH);
+        // Only cheap, loader-lock-safe calls here; the rest is in LogEnvironmentOnce.
+        Log("NIER_FSR4 %s loaded from %ls (FSR SDK 2.3.0 / FSR %d.%d.%d API)", NIER_FSR4_BUILD, path,
+            FFX_UPSCALER_VERSION_MAJOR, FFX_UPSCALER_VERSION_MINOR, FFX_UPSCALER_VERSION_PATCH);
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        char winver[64] = "?";
+        if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"))
+            if (auto getVersion = (LONG(WINAPI*)(OSVERSIONINFOW*))GetProcAddress(ntdll, "RtlGetVersion"))
+            {
+                OSVERSIONINFOW v{};
+                v.dwOSVersionInfoSize = sizeof v;
+                if (getVersion(&v) == 0)
+                    snprintf(winver, sizeof winver, "%lu.%lu build %lu", v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
+            }
+        Log("process %ls, Windows %s", exe, winver);
         LoadConfig();
     }
     return TRUE;
