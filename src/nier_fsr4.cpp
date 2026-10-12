@@ -134,6 +134,12 @@ void LogRepeat(const char* fmt, ...)
 // known. Caller supplies the buffer, so it is thread safe. Used on error paths only.
 const char* HrText(HRESULT hr, char* buf, size_t n)
 {
+    if (SUCCEEDED(hr))
+    {
+        if (n)
+            buf[0] = 0;
+        return buf;
+    }
     const char* name = nullptr;
     switch ((unsigned long)hr)
     {
@@ -453,6 +459,7 @@ struct SharedTex
     UINT w = 0, h = 0;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     bool uav = false;
+    int flagsIdx = 0;  // flag set that worked last for this texture (0 = plain, 1 = simultaneous access); kept across Release
 
     void Release()
     {
@@ -495,7 +502,6 @@ struct Bridge
     bool providerChosen = false;  // FSR provider query done for this device
     uint64_t provider = 0;        // version id to request, 0 = SDK default
     std::vector<uint64_t> providerIds;  // every provider for this device, newest first
-    int sharedFlagsIdx = 0;  // index of the shared-texture flag set that worked last (0 = plain, 1 = simultaneous access)
     ULONGLONG failedAt = 0;  // last failed creation, retried after 10 s; cleared by NGX Shutdown
 
     bool Init(ID3D11Device* device);
@@ -760,7 +766,7 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     // guaranteed-failing plain attempt is skipped on every later resize), then
     // fall back to the other one.
     const D3D12_RESOURCE_FLAGS attempts[] = {base, base | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS};
-    const int order[2] = {sharedFlagsIdx ? 1 : 0, sharedFlagsIdx ? 0 : 1};
+    const int order[2] = {s.flagsIdx ? 1 : 0, s.flagsIdx ? 0 : 1};
     HRESULT hr = E_FAIL;
     std::string failures;  // one line for the whole texture, not one per attempt
     for (int idx : order)
@@ -774,17 +780,20 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
         if (SUCCEEDED(hr))
         {
             HANDLE h = nullptr;
+            stage = "share";
             hr = dev12->CreateSharedHandle(s.r12, nullptr, GENERIC_ALL, nullptr, &h);
             if (SUCCEEDED(hr))
             {
+                stage = "open in D3D11";
                 hr = dev11_5->OpenSharedResource1(h, __uuidof(ID3D11Texture2D), (void**)&s.t11);
                 CloseHandle(h);
             }
-            stage = "open in D3D11";
         }
         if (SUCCEEDED(hr))
         {
-            sharedFlagsIdx = idx;
+            if (idx == 1 && s.flagsIdx == 0)
+                Log("bridge: the shared %s texture needed the fallback flags 0x%x on this driver", what, (unsigned)flags);
+            s.flagsIdx = idx;
             break;
         }
         char one[240];
@@ -862,7 +871,7 @@ void Bridge::Shutdown()
     providerChosen = false;
     provider = 0;
     providerIds.clear();
-    sharedFlagsIdx = 0;
+    color.flagsIdx = depth.flagsIdx = mv.flagsIdx = output.flagsIdx = 0;
 }
 
 // ---------------------------------------------------------------------------

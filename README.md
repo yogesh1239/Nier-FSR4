@@ -23,9 +23,11 @@ NieRAutomata.exe
 
 ## Install
 
-1. Download `NIER_FSR4.zip` from the [Releases](../../releases) page and extract it.
+1. Download `NIER_FSR4.zip` from the [Releases](https://github.com/yogesh1239/Nier-FSR4/releases) page and extract it.
 2. If the game folder already has a `d3d11.dll` (Special K, ReShade, the original NIER_DLAA mod), back it up first.
    The package's `d3d11.dll` replaces it.
+   If it is Special K installed as a local `d3d11.dll`, switch Special K to global injection (SKIF) or rename it to
+   `dxgi.dll`; the `d3d11.dll` slot belongs to this package. Special K started through Steam launch options works as is.
 3. Copy the contents of the `NIER_FSR4` folder into the folder that contains `NieRAutomata.exe`.
 
 The package is self-contained. It holds the already patched NIER_DLAA `d3d11.dll` (so there is nothing to patch),
@@ -37,7 +39,9 @@ the character motion vectors (`ObjectMotion=1`). The mod hides the blur itself. 
 
 Tested on an RX 9070 XT, standalone and together with Special K (launched via Steam launch options).
 
-To uninstall, delete those files plus `NIER_FSR4.log`, `NIER_FSR4.prev.log` and `NIER_DLAA.log`, and restore the
+To uninstall, delete the 8 files of the package (`d3d11.dll`, `NIER_DLAA.ini`, `NIER_FSR4.dll`, `NIER_FSR4.ini`,
+`amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`, `AMD_FidelityFX_LICENSE.md`,
+`NIER_FSR4_README.md`) plus `NIER_FSR4.log`, `NIER_FSR4.prev.log` and `NIER_DLAA.log`, and restore the
 `d3d11.dll` you backed up.
 
 ## Troubleshooting
@@ -46,11 +50,11 @@ Attach `NIER_FSR4.log`, `NIER_FSR4.prev.log` (the previous session) and `NIER_DL
 The first lines of `NIER_FSR4.log` show the build, Windows version, the GPU and driver, which `d3d11.dll` called
 into the DLL (and whether it is the patched NIER_DLAA 1.1) and any overlay or hook DLLs found in the process.
 If `NIER_FSR4.log` is missing, the patched `d3d11.dll` is not in place or another mod that also uses
-`d3d11.dll` overwrote it.
+`d3d11.dll` overwrote it, or the game folder is not writable (Controlled Folder Access, Program Files).
 
 ## Build from source
 
-The repo carries the NIER_DLAA 1.1 files it builds on in `third_party/NIER_DLAA` (see the README there).
+The repo carries the NIER_DLAA 1.1 files it builds on in `third_party/NIER_DLAA` (see the README there, in the repository).
 
 ```
 sudo apt install mingw-w64            # or any MinGW-w64 g++ on Windows
@@ -83,7 +87,7 @@ Logs go to `NIER_FSR4.log` (FSR side, the previous session is kept as `NIER_FSR4
 Built and checked on Linux with MinGW (exports, vtable layout, patch disassembly and a Wine smoke test of the
 NGX entry points), and tested in game on an AMD Radeon RX 9070 XT, standalone and together with Special K.
 
-How the mod was taken apart is in [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md).
+How the mod was taken apart is in [docs/REVERSE_ENGINEERING.md](https://github.com/yogesh1239/Nier-FSR4/blob/main/docs/REVERSE_ENGINEERING.md).
 
 FSR headers in `third_party/FidelityFX` are © AMD, under the license in that folder.
 

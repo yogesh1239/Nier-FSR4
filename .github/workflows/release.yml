@@ -13,8 +13,10 @@ on:
 permissions:
   contents: read
 
+# Only pull request runs are cancelled when superseded. Runs on main are never
+# cancelled, so every merge gets its release.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -169,9 +171,6 @@ jobs:
     needs: [build, smoke-test]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
-    concurrency:
-      group: release
-      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -185,10 +184,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.build.outputs.tag }}
         run: |
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $TAG already exists, nothing to do"
-            exit 0
+          # Skip only a complete release. A leftover draft or a release without
+          # its zip (failed upload) is deleted together with its tag and redone.
+          if state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets \
+                       -q '[.isDraft, (.assets | length)] | @tsv' 2>/dev/null); then
+            if [ "$state" = "$(printf 'false\t1')" ]; then
+              echo "release $TAG is already published"
+              exit 0
+            fi
+            echo "release $TAG is incomplete ($state), recreating it"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           fi
+          # Only the newest main commit may become Latest, so out-of-order runs
+          # cannot mark an older build as Latest.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" = "$GITHUB_SHA" ]; then latest=true; else latest=false; fi
           {
             echo "Automated build of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
             echo
@@ -201,6 +211,7 @@ jobs:
           ### Install
           1. Download `NIER_FSR4.zip` and extract it.
           2. If the game folder already has a `d3d11.dll` (Special K, ReShade or the original NIER_DLAA mod), **back it up first**. This package's `d3d11.dll` replaces it.
+          If it is Special K installed as a local `d3d11.dll`, switch Special K to global injection (SKIF) or rename it to `dxgi.dll`; the `d3d11.dll` slot belongs to this package. Special K started through Steam launch options works as is.
           3. Copy the contents of the `NIER_FSR4` folder next to `NieRAutomata.exe`.
 
           Nothing else is needed: the zip already contains the patched NIER_DLAA `d3d11.dll`, so there is nothing to patch. A leftover `nvngx_dlss.dll` from the old mod can be deleted.
@@ -213,7 +224,7 @@ jobs:
 
           ### Troubleshooting
           Attach `NIER_FSR4.log`, `NIER_FSR4.prev.log` (the previous session) and `NIER_DLAA.log` from the game folder.
-          If `NIER_FSR4.log` is missing, `d3d11.dll` is not in place, or another mod that also uses `d3d11.dll` overwrote it.
+          If `NIER_FSR4.log` is missing, `d3d11.dll` is not in place, or another mod that also uses `d3d11.dll` overwrote it, or the game folder is not writable (Controlled Folder Access, Program Files).
 
           ### Uninstall
           Delete `d3d11.dll`, `NIER_DLAA.ini`, `NIER_FSR4.dll`, `NIER_FSR4.ini`, `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`, `AMD_FidelityFX_LICENSE.md`, `NIER_FSR4_README.md`, `NIER_FSR4.log`, `NIER_FSR4.prev.log` and `NIER_DLAA.log` from the game folder, then restore your backed-up `d3d11.dll` if you had one.
@@ -224,4 +235,4 @@ jobs:
           EOF
           gh release create "$TAG" out/NIER_FSR4.zip \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "NIER_FSR4 $TAG" --notes-file notes.md
+            --title "NIER_FSR4 $TAG" --notes-file notes.md --latest="$latest"
