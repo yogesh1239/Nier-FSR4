@@ -1,0 +1,238 @@
+# Builds NIER_FSR4.dll and the self-contained NIER_FSR4.zip (patched NIER_DLAA
+# d3d11.dll + NIER_FSR4 + AMD FSR binaries), smoke-tests the extracted zip on
+# Windows, and publishes a GitHub release for every push to main (i.e. every
+# merged pull request) and for manual runs on main.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only pull request runs are cancelled when superseded. Runs on main are never
+# cancelled, so every merge gets its release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Must match the headers in third_party/FidelityFX.
+  FFX_SDK_TAG: v2.3.0
+  # Release tags are v<RELEASE_BASE>.<run number>. Bump the minor version if
+  # the run number ever restarts (e.g. the workflow file is recreated).
+  RELEASE_BASE: "1.0"
+  # sha256 pins. The NIER_DLAA original is checked before patching, the patched
+  # d3d11.dll after patching, inside the zip and again after extraction.
+  SHA_DLAA_ORIGINAL: f1c77c58fdd265b25dfa262c8660d49a4463a05bb0ee88daf732727f15e717ce
+  SHA_DLAA_PATCHED: 3d628eb576b505180206653d72e4e4da6a4345334f19863256ab5b10e06b6915
+  SHA_DLAA_INI: 7016a23820c56b8afc3d17a7f4a3c84af1a8df57930b1f2334f7f6bc00a504cc
+  SHA_AMD_LOADER: e2d85aa05a9bd9ed8b38935fdf5199372cca6f74c12015143bb6f945ee1608aa
+  SHA_AMD_UPSCALER: d0dcccc74a43c44ba435b7a369b456e0970d8a4464e4bd683119b374f2c9fb46
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Version
+        id: ver
+        run: |
+          TAG="v${RELEASE_BASE}.${GITHUB_RUN_NUMBER}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Compiled into NIER_FSR4.dll and printed on the first line of its log.
+          echo "NIER_FSR4_BUILD=${TAG}+${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mingw-w64
+
+      - name: Fetch FSR signed binaries (FidelityFX SDK ${{ env.FFX_SDK_TAG }})
+        run: |
+          git clone --depth 1 --branch "$FFX_SDK_TAG" --filter=blob:none --sparse \
+            https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK sdk
+          git -C sdk sparse-checkout set Kits/FidelityFX/signedbin Kits/FidelityFX/docs
+
+      - name: Verify pinned inputs
+        run: |
+          sha256sum -c - <<EOF
+          ${SHA_AMD_LOADER}  sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll
+          ${SHA_AMD_UPSCALER}  sdk/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll
+          ${SHA_DLAA_ORIGINAL}  third_party/NIER_DLAA/d3d11.dll
+          ${SHA_DLAA_INI}  third_party/NIER_DLAA/NIER_DLAA.ini
+          EOF
+
+      - name: Build and assemble package
+        env:
+          CXX: x86_64-w64-mingw32-g++-posix
+        run: |
+          # The two-argument form patches the mod and copies exactly the files
+          # that belong in the package into out/package (no tools/, no nvngx).
+          ./build.sh third_party/NIER_DLAA sdk
+          $CXX -std=c++17 -O2 -Wall -static -o out/smoke.exe tests/smoke.cpp
+          echo "${SHA_DLAA_PATCHED}  out/package/d3d11.dll" | sha256sum -c -
+          mv out/package out/NIER_FSR4
+          (cd out && zip -r9 NIER_FSR4.zip NIER_FSR4)
+
+      - name: Check package contents
+        run: |
+          export LC_ALL=C
+          expected=$(printf 'NIER_FSR4/%s\n' d3d11.dll NIER_DLAA.ini NIER_FSR4.dll NIER_FSR4.ini \
+            amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll AMD_FidelityFX_LICENSE.md NIER_FSR4_README.md | sort)
+          actual=$(unzip -Z1 out/NIER_FSR4.zip | grep -v '/$' | sort)
+          if unzip -Z1 out/NIER_FSR4.zip | grep -iE '(^|/)(nvngx|smoke|patched_mod)'; then
+            echo "::error::forbidden file in the package"; exit 1
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::package file list differs from the expected one"
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+          got=$(unzip -p out/NIER_FSR4.zip NIER_FSR4/d3d11.dll | sha256sum | cut -d' ' -f1)
+          if [ "$got" = "$SHA_DLAA_ORIGINAL" ]; then
+            echo "::error::the package contains the UNPATCHED NIER_DLAA d3d11.dll"; exit 1
+          fi
+          if [ "$got" != "$SHA_DLAA_PATCHED" ]; then
+            echo "::error::package d3d11.dll is not the pinned patched build ($got)"; exit 1
+          fi
+          echo "package ok: $(echo "$actual" | wc -l) files"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: |
+            out/NIER_FSR4.zip
+            out/smoke.exe
+          if-no-files-found: error
+
+  smoke-test:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: out
+
+      - name: Extract the package
+        shell: pwsh
+        run: |
+          Expand-Archive out\NIER_FSR4.zip pkg
+          # smoke.exe has to sit next to NIER_FSR4.dll: the patched stub loads it by name.
+          Copy-Item out\smoke.exe pkg\NIER_FSR4\smoke.exe
+
+      - name: Check the shipped files
+        shell: pwsh
+        run: |
+          $dir = (Resolve-Path pkg\NIER_FSR4).Path
+          $h = (Get-FileHash "$dir\d3d11.dll" -Algorithm SHA256).Hash
+          if ($h -ne $env:SHA_DLAA_PATCHED) { throw "d3d11.dll in the zip is not the patched build: $h" }
+          foreach ($n in 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll') {
+            $s = Get-AuthenticodeSignature "$dir\$n"
+            Write-Host "$n : $($s.Status) : $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid') { throw "$n signature is $($s.Status)" }
+            if ($s.SignerCertificate.Subject -notmatch 'Advanced Micro Devices') { throw "$n is not signed by AMD" }
+          }
+
+      - name: Run smoke test
+        shell: pwsh
+        run: |
+          $dir = (Resolve-Path pkg\NIER_FSR4).Path
+          # Test the mod under another name so it does not shadow the system d3d11.dll.
+          Move-Item "$dir\d3d11.dll" "$dir\patched_mod.dll"
+          & "$dir\smoke.exe" $dir "$dir\patched_mod.dll"
+          if ($LASTEXITCODE -ne 0) { throw "smoke.exe exited with $LASTEXITCODE" }
+          if (-not (Test-Path "$dir\NIER_FSR4.log")) { throw "NIER_FSR4.log was not written" }
+          $log = Get-Content "$dir\NIER_FSR4.log" -Raw
+          Write-Host $log
+          if ($log -notmatch 'NIER_FSR4 v\d+\.\d+\.\d+\+[0-9a-f]{7} loaded from') { throw "log lacks the build id / loaded-from line" }
+          if ($log -notmatch '^NIER_FSR4 log, \d{4}-\d{2}-\d{2}') { throw "log lacks the date header" }
+          if (Test-Path "$dir\NIER_FSR4.prev.log") { throw "NIER_FSR4.prev.log exists after the first run" }
+
+      - name: Run smoke test again (log rotation)
+        shell: pwsh
+        run: |
+          $dir = (Resolve-Path pkg\NIER_FSR4).Path
+          & "$dir\smoke.exe" $dir "$dir\patched_mod.dll"
+          if ($LASTEXITCODE -ne 0) { throw "smoke.exe exited with $LASTEXITCODE" }
+          foreach ($n in 'NIER_FSR4.log', 'NIER_FSR4.prev.log') {
+            if (-not (Test-Path "$dir\$n")) { throw "$n is missing after the second run" }
+            if ((Get-Content "$dir\$n" -Raw) -notmatch 'loaded from') { throw "$n has no loaded-from line" }
+          }
+
+  release:
+    needs: [build, smoke-test]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: out
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          # Skip only a complete release. A leftover draft or a release without
+          # its zip (failed upload) is deleted together with its tag and redone.
+          if state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets \
+                       -q '[.isDraft, (.assets | length)] | @tsv' 2>/dev/null); then
+            if [ "$state" = "$(printf 'false\t1')" ]; then
+              echo "release $TAG is already published"
+              exit 0
+            fi
+            echo "release $TAG is incomplete ($state), recreating it"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          # Only the newest main commit may become Latest, so out-of-order runs
+          # cannot mark an older build as Latest.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" = "$GITHUB_SHA" ]; then latest=true; else latest=false; fi
+          {
+            echo "Automated build of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo
+            echo "FSR binaries: AMD FidelityFX SDK ${FFX_SDK_TAG}, see AMD_FidelityFX_LICENSE.md in the zip."
+          } > notes.md
+          cat >> notes.md <<'EOF'
+
+          Tested on RX 9070 XT, works alongside Special K.
+
+          ### Install
+          1. Download `NIER_FSR4.zip` and extract it.
+          2. If the game folder already has a `d3d11.dll` (Special K, ReShade or the original NIER_DLAA mod), **back it up first**. This package's `d3d11.dll` replaces it.
+          If it is Special K installed as a local `d3d11.dll`, switch Special K to global injection (SKIF) or rename it to `dxgi.dll` (untested); the `d3d11.dll` slot belongs to this package. Special K started through Steam launch options works as is.
+          3. Copy the contents of the `NIER_FSR4` folder next to `NieRAutomata.exe`.
+
+          Nothing else is needed: the zip already contains the patched NIER_DLAA `d3d11.dll`, so there is nothing to patch. A leftover `nvngx_dlss.dll` from the old mod can be deleted.
+
+          ### Requirements
+          - FSR 4 needs a Radeon RX 7000 or RX 9000 GPU. Other GPUs fall back to FSR 3.1.x.
+          - Turn the game's own anti-aliasing off. Keep Motion Blur on if you want character motion vectors (the mod hides the blur itself).
+          - Home toggles the AA, as with the original mod.
+          - Special K works alongside this mod (it hooks through the same `d3d11.dll` proxy). It was tested launched via Steam launch options.
+
+          ### Troubleshooting
+          Attach `NIER_FSR4.log`, `NIER_FSR4.prev.log` (the previous session) and `NIER_DLAA.log` from the game folder.
+          If `NIER_FSR4.log` is missing, `d3d11.dll` is not in place, or another mod that also uses `d3d11.dll` overwrote it, or the game folder is not writable (Controlled Folder Access, Program Files).
+
+          ### Uninstall
+          Delete `d3d11.dll`, `NIER_DLAA.ini`, `NIER_FSR4.dll`, `NIER_FSR4.ini`, `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`, `AMD_FidelityFX_LICENSE.md`, `NIER_FSR4_README.md`, `NIER_FSR4.log`, `NIER_FSR4.prev.log` and `NIER_DLAA.log` from the game folder, then restore your backed-up `d3d11.dll` if you had one.
+
+          ### Credits
+          - NIER_DLAA 1.1 by its author (NIER_DLAA on Nexus Mods). Its `d3d11.dll` is shipped here only with the 41-byte NGX loader patch applied.
+          - AMD FidelityFX SDK, used under the license in `AMD_FidelityFX_LICENSE.md`.
+          EOF
+          gh release create "$TAG" out/NIER_FSR4.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "NIER_FSR4 $TAG" --notes-file notes.md --latest="$latest"
