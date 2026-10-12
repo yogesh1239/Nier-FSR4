@@ -102,7 +102,9 @@ written at `0x1800166ea`. The main-camera projection rows live at `0x1800abe78..
 FSR 4 only ships a DX12 backend. `NIER_FSR4.dll` works like this:
 
 1. Create a D3D12 device on the game's adapter, matched by LUID through `IDXGIFactory4::EnumAdapterByLuid`.
-2. Create one shared `ID3D12Fence` and open it in D3D11 (`ID3D11Device5::OpenSharedFence`).
+2. Create two shared fences, each written by only one device so neither can be wound back by the
+   other's queued signals: a "done" `ID3D12Fence` opened in D3D11 (`ID3D11Device5::OpenSharedFence`),
+   and a "ready" `ID3D11Fence` (`ID3D11Device5::CreateFence`) opened in D3D12 (`OpenSharedHandle`).
 3. Create shared committed textures (`D3D12_HEAP_FLAG_SHARED`) for colour, depth, motion vectors and
    output (output gets UAV), and open them in D3D11 (`OpenSharedResource1`).
 4. Every frame:

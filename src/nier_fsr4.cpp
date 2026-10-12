@@ -11,7 +11,8 @@
 //
 // FSR 4 only has a DirectX 12 backend and the game is DirectX 11, so this DLL
 // creates a D3D12 device on the same adapter and moves the frame across with
-// shared textures and a shared fence:
+// shared textures and two shared fences ("ready" written by D3D11, "done"
+// written by D3D12):
 //   D3D11: copy colour/depth/motion vectors into shared textures, signal
 //   D3D12: wait, FSR dispatch into a shared output texture, signal
 //   D3D11: wait, copy the shared output into the mod's DLSS output target
@@ -375,7 +376,14 @@ struct Bridge
     ID3D11Device* dev11 = nullptr;
     ID3D11Device5* dev11_5 = nullptr;
     ID3D11DeviceContext4* ctx11 = nullptr;
-    ID3D11Fence* fence11 = nullptr;
+    // Two shared fences, each written by one device only, so neither can
+    // ever be wound back by the other side's queued signals:
+    //   ready: created on D3D11, signalled by D3D11, waited on by D3D12
+    //   done:  created on D3D12, signalled by D3D12, waited on by D3D11 + CPU
+    ID3D11Fence* readyFence11 = nullptr;
+    ID3D12Fence* readyFence12 = nullptr;
+    UINT64 readyValue = 0;
+    ID3D11Fence* fence11 = nullptr;  // the done fence, D3D11 side
 
     ID3D12Device* dev12 = nullptr;
     ID3D12CommandQueue* queue = nullptr;
@@ -384,8 +392,8 @@ struct Bridge
     UINT64 allocFence[kFrames] = {};
     int frame = 0;
     ID3D12GraphicsCommandList* list = nullptr;
-    ID3D12Fence* fence12 = nullptr;
-    UINT64 fenceValue = 0;
+    ID3D12Fence* fence12 = nullptr;  // the done fence
+    UINT64 fenceValue = 0;           // last done value
     HANDLE fenceEvent = nullptr;
 
     SharedTex color, depth, mv, output;
@@ -521,6 +529,24 @@ bool Bridge::Create(ID3D11Device* device)
         Log("bridge: OpenSharedFence failed: 0x%08lX", (unsigned long)hr);
         return false;
     }
+    if (FAILED(hr = dev11_5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence), (void**)&readyFence11)))
+    {
+        Log("bridge: creating the D3D11 fence failed: 0x%08lX", (unsigned long)hr);
+        return false;
+    }
+    h = nullptr;
+    if (FAILED(hr = readyFence11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &h)))
+    {
+        Log("bridge: sharing the D3D11 fence failed: 0x%08lX", (unsigned long)hr);
+        return false;
+    }
+    hr = dev12->OpenSharedHandle(h, __uuidof(ID3D12Fence), (void**)&readyFence12);
+    CloseHandle(h);
+    if (FAILED(hr))
+    {
+        Log("bridge: opening the D3D11 fence in D3D12 failed: 0x%08lX", (unsigned long)hr);
+        return false;
+    }
     fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!fenceEvent)
     {
@@ -561,10 +587,9 @@ bool Bridge::WaitCpu(UINT64 v)
             // Only a removed D3D12 device guarantees nothing of ours still
             // runs; with just the game's device removed, D3D12 work may still
             // wait on it, so MarkLost leaves it as hung (leaked).
-            MarkLost(FAILED(removed12) || done == UINT64_MAX ? "D3D12 device removed" : "the game's D3D11 device was removed",
+            MarkLost(FAILED(removed12) ? "D3D12 device removed" : FAILED(removed11) ? "the game's D3D11 device was removed"
+                                                                                      : "the done fence reports removal",
                      FAILED(removed12) ? removed12 : removed11);
-            if (done == UINT64_MAX)
-                hung = false;
             return false;
         }
         if (done >= v)
@@ -688,6 +713,8 @@ void Bridge::Shutdown()
     SafeRelease(queue);
     SafeRelease(fence11);
     SafeRelease(fence12);
+    SafeRelease(readyFence12);
+    SafeRelease(readyFence11);
     SafeRelease(ctx11);
     SafeRelease(dev12);
     SafeRelease(dev11_5);
@@ -696,6 +723,7 @@ void Bridge::Shutdown()
         CloseHandle(fenceEvent);
     fenceEvent = nullptr;
     fenceValue = 0;
+    readyValue = 0;
     frame = 0;
     for (auto& f : allocFence)
         f = 0;
@@ -1034,8 +1062,8 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     ctx->CopySubresourceRegion(b.color.t11, 0, 0, 0, 0, color, 0, nullptr);
     ctx->CopySubresourceRegion(b.depth.t11, 0, 0, 0, 0, depth, 0, nullptr);
     ctx->CopySubresourceRegion(b.mv.t11, 0, 0, 0, 0, mvs, 0, nullptr);
-    UINT64 ready = ++b.fenceValue;
-    HRESULT hr = b.ctx11->Signal(b.fence11, ready);
+    UINT64 ready = ++b.readyValue;
+    HRESULT hr = b.ctx11->Signal(b.readyFence11, ready);
     if (FAILED(hr))
     {
         b.MarkLost("D3D11 fence signal failed", hr);
@@ -1084,7 +1112,7 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     d.viewSpaceToMetersFactor = g_cfg.viewToMeters;
     d.flags = g_cfg.debugView ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0;
 
-    if (FAILED(hr = b.queue->Wait(b.fence12, ready)))
+    if (FAILED(hr = b.queue->Wait(b.readyFence12, ready)))
     {
         b.list->Close();
         b.MarkLost("D3D12 queue wait failed", hr);

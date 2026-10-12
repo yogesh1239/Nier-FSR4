@@ -11,7 +11,7 @@ vectors, linear depth and mip bias. Only the DLSS backend is replaced:
 NieRAutomata.exe
   └─ d3d11.dll  (NIER_DLAA 1.1, one 41-byte patch)
        └─ NGX static lib → NIER_FSR4.dll  (stands in for NVIDIA's _nvngx.dll core)
-            ├─ D3D11 → D3D12 bridge on the same GPU (shared textures + shared fence)
+            ├─ D3D11 → D3D12 bridge on the same GPU (shared textures + shared fences)
             └─ amd_fidelityfx_loader_dx12.dll → amd_fidelityfx_upscaler_dx12.dll (FSR 4.1.1)
 ```
 
