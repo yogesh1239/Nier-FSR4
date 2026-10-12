@@ -897,6 +897,10 @@ bool Feature::CreateContext()
         rc = g_ffx.CreateContext(&ctx, &desc.header, nullptr);
         if (rc == FFX_API_RETURN_OK)
             break;
+        // Each failed attempt leaks some memory inside the SDK. Out of memory
+        // or a removed device will fail on every provider, so stop there.
+        if (rc == FFX_API_RETURN_ERROR_MEMORY || FAILED(g_bridge.dev12->GetDeviceRemovedReason()))
+            break;
         if (i + 1 < candidates.size())
             LogRepeat("FSR: provider 0x%llX failed (%u), trying the next one", (unsigned long long)candidates[i], rc);
     }
