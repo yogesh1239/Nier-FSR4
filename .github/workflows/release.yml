@@ -211,7 +211,7 @@ jobs:
           ### Install
           1. Download `NIER_FSR4.zip` and extract it.
           2. If the game folder already has a `d3d11.dll` (Special K, ReShade or the original NIER_DLAA mod), **back it up first**. This package's `d3d11.dll` replaces it.
-          If it is Special K installed as a local `d3d11.dll`, switch Special K to global injection (SKIF) or rename it to `dxgi.dll`; the `d3d11.dll` slot belongs to this package. Special K started through Steam launch options works as is.
+          If it is Special K installed as a local `d3d11.dll`, switch Special K to global injection (SKIF) or rename it to `dxgi.dll` (untested); the `d3d11.dll` slot belongs to this package. Special K started through Steam launch options works as is.
           3. Copy the contents of the `NIER_FSR4` folder next to `NieRAutomata.exe`.
 
           Nothing else is needed: the zip already contains the patched NIER_DLAA `d3d11.dll`, so there is nothing to patch. A leftover `nvngx_dlss.dll` from the old mod can be deleted.
