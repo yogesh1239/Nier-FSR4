@@ -647,25 +647,43 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     rd.Format = fmt;
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
-    HRESULT hr = dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                __uuidof(ID3D12Resource), (void**)&s.r12);
-    if (FAILED(hr))
+    // D3D11 refuses (E_INVALIDARG) to open a shared texture that has neither a
+    // render target nor a UAV usage, so add render target where the format allows.
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{fmt};
+    bool rt = SUCCEEDED(dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) &&
+              (fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+    D3D12_RESOURCE_FLAGS base = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    if (rt)
+        base |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    // Some drivers also want simultaneous access for cross-API sharing; try that second.
+    const D3D12_RESOURCE_FLAGS attempts[] = {base, base | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS};
+    HRESULT hr = E_FAIL;
+    for (D3D12_RESOURCE_FLAGS flags : attempts)
     {
-        LogRepeat("bridge: creating the shared %s texture %ux%u fmt %d failed: 0x%08lX", what, sd.Width, sd.Height, fmt,
+        s.Release();
+        rd.Flags = flags;
+        hr = dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                            __uuidof(ID3D12Resource), (void**)&s.r12);
+        if (FAILED(hr))
+        {
+            LogRepeat("bridge: creating the shared %s texture %ux%u fmt %d flags 0x%x failed: 0x%08lX", what, sd.Width,
+                sd.Height, fmt, (unsigned)flags, (unsigned long)hr);
+            continue;
+        }
+        HANDLE h = nullptr;
+        hr = dev12->CreateSharedHandle(s.r12, nullptr, GENERIC_ALL, nullptr, &h);
+        if (SUCCEEDED(hr))
+        {
+            hr = dev11_5->OpenSharedResource1(h, __uuidof(ID3D11Texture2D), (void**)&s.t11);
+            CloseHandle(h);
+        }
+        if (SUCCEEDED(hr))
+            break;
+        LogRepeat("bridge: opening the shared %s texture (flags 0x%x) in D3D11 failed: 0x%08lX", what, (unsigned)flags,
             (unsigned long)hr);
-        return false;
-    }
-    HANDLE h = nullptr;
-    hr = dev12->CreateSharedHandle(s.r12, nullptr, GENERIC_ALL, nullptr, &h);
-    if (SUCCEEDED(hr))
-    {
-        hr = dev11_5->OpenSharedResource1(h, __uuidof(ID3D11Texture2D), (void**)&s.t11);
-        CloseHandle(h);
     }
     if (FAILED(hr))
     {
-        LogRepeat("bridge: opening the shared %s texture in D3D11 failed: 0x%08lX", what, (unsigned long)hr);
         s.Release();
         return false;
     }
@@ -673,7 +691,8 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     s.h = sd.Height;
     s.fmt = fmt;
     s.uav = uav;
-    Log("bridge: shared %s texture %ux%u, game format %d, shared format %d", what, s.w, s.h, sd.Format, fmt);
+    Log("bridge: shared %s texture %ux%u, game format %d, shared format %d, flags 0x%x", what, s.w, s.h, sd.Format, fmt,
+        (unsigned)rd.Flags);
     return true;
 }
 
