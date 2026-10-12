@@ -400,7 +400,7 @@ struct Bridge
     bool Init(ID3D11Device* device);
     bool Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* what);
     bool WaitCpu(UINT64 v);
-    void Abandon(const char* why, HRESULT hr);
+    void MarkLost(const char* why, HRESULT hr);
     void Shutdown();
 
 private:
@@ -554,19 +554,24 @@ bool Bridge::WaitCpu(UINT64 v)
     for (;;)
     {
         UINT64 done = fence12->GetCompletedValue();
-        if (done == UINT64_MAX || FAILED(dev12->GetDeviceRemovedReason()) ||
-            FAILED(dev11->GetDeviceRemovedReason()))
+        HRESULT removed12 = dev12->GetDeviceRemovedReason();
+        HRESULT removed11 = dev11->GetDeviceRemovedReason();
+        if (done == UINT64_MAX || FAILED(removed12) || FAILED(removed11))
         {
-            Log("bridge: device removed (D3D12 0x%08lX, D3D11 0x%08lX), FSR is off until the game re-creates it",
-                (unsigned long)dev12->GetDeviceRemovedReason(), (unsigned long)dev11->GetDeviceRemovedReason());
-            lost = true;
+            // Only a removed D3D12 device guarantees nothing of ours still
+            // runs; with just the game's device removed, D3D12 work may still
+            // wait on it, so MarkLost leaves it as hung (leaked).
+            MarkLost(FAILED(removed12) || done == UINT64_MAX ? "D3D12 device removed" : "the game's D3D11 device was removed",
+                     FAILED(removed12) ? removed12 : removed11);
+            if (done == UINT64_MAX)
+                hung = false;
             return false;
         }
         if (done >= v)
             return true;
         if (GetTickCount64() - start > 10000)
         {
-            Abandon("the GPU made no progress for 10 s", S_OK);
+            MarkLost("the GPU made no progress for 10 s", S_OK);
             return false;
         }
         if (SUCCEEDED(fence12->SetEventOnCompletion(v, fenceEvent)))
@@ -647,17 +652,18 @@ bool Bridge::Ensure(SharedTex& s, ID3D11Resource* src, bool uav, const char* wha
     return true;
 }
 
-// Gives up on the bridge after a failed or stuck GPU call. Signalling the
-// shared fence to its maximum from the CPU releases every wait already queued
-// on either device, so the game's D3D11 context cannot stay blocked on a
-// value that will never come.
-void Bridge::Abandon(const char* why, HRESULT hr)
+// Turns FSR off after a failed or stuck GPU call. Every early return in
+// Evaluate leaves the queued Signal/Wait pairs balanced, so nothing is forced
+// here (forcing the shared fence from the CPU would be overwritten by signals
+// already queued and could block the game's context). Resources may only be
+// released later if the D3D12 device itself is gone; otherwise work may still
+// be queued on it and everything is leaked instead.
+void Bridge::MarkLost(const char* why, HRESULT hr)
 {
-    Log("bridge: %s (0x%08lX), FSR is off", why, (unsigned long)hr);
     lost = true;
-    hung = true;
-    if (fence12)
-        fence12->Signal(UINT64_MAX);
+    hung = !(dev12 && FAILED(dev12->GetDeviceRemovedReason()));
+    Log("bridge: %s (0x%08lX), FSR is off%s", why, (unsigned long)hr,
+        hung ? "" : " (D3D12 device removed)");
 }
 
 void Bridge::Shutdown()
@@ -1028,7 +1034,7 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     HRESULT hr = b.ctx11->Signal(b.fence11, ready);
     if (FAILED(hr))
     {
-        b.Abandon("D3D11 fence signal failed", hr);
+        b.MarkLost("D3D11 fence signal failed", hr);
         return NGX_Fail;
     }
     ctx->Flush();
@@ -1043,7 +1049,7 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     }
     if (FAILED(hr = b.alloc[slot]->Reset()) || FAILED(hr = b.list->Reset(b.alloc[slot], nullptr)))
     {
-        b.Abandon("command list reset failed", hr);
+        b.MarkLost("command list reset failed", hr);
         return NGX_Fail;
     }
 
@@ -1077,7 +1083,7 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     if (FAILED(hr = b.queue->Wait(b.fence12, ready)))
     {
         b.list->Close();
-        b.Abandon("D3D12 queue wait failed", hr);
+        b.MarkLost("D3D12 queue wait failed", hr);
         return NGX_Fail;
     }
     ffxReturnCode_t rc = g_ffx.Dispatch(&ft.ctx, &d.header);
@@ -1091,19 +1097,19 @@ NVSDK_NGX_Result Evaluate(ID3D11DeviceContext* ctx, Feature& ft, const NgxParams
     b.allocFence[slot] = done;
     if (FAILED(hr = b.queue->Signal(b.fence12, done)))
     {
-        b.Abandon("D3D12 queue signal failed", hr);
+        b.MarkLost("D3D12 queue signal failed", hr);
         return NGX_Fail;
     }
 
     // 3. shared output -> D3D11
     if (FAILED(hr = b.ctx11->Wait(b.fence11, done)))
     {
-        b.Abandon("D3D11 fence wait failed", hr);
+        b.MarkLost("D3D11 fence wait failed", hr);
         return NGX_Fail;
     }
     if (FAILED(closed))
     {
-        b.Abandon("closing the command list failed", closed);
+        b.MarkLost("closing the command list failed", closed);
         return NGX_Fail;
     }
     if (rc != FFX_API_RETURN_OK)

@@ -1,6 +1,8 @@
 // Wine/Windows smoke test: drives NIER_FSR4.dll the way the mod's MSVC code
 // does (raw vtable offsets), and checks the patched NGXLoadCoreLibrary stub.
-//   smoke.exe <dir of smoke.exe, holding NIER_FSR4.dll> [patched d3d11.dll]
+//   smoke.exe <dir of smoke.exe, holding NIER_FSR4.dll> [patched mod dll]
+// Under Wine pass the patched mod under a name other than d3d11.dll (or set
+// WINEDLLOVERRIDES=d3d11=n,b), otherwise Wine loads its built-in d3d11.
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -24,7 +26,15 @@ static HMODULE StubTest(const char* modPath, const char* dir)
         return nullptr;
     char* base = (char*)mod;
     CHECK(GetModuleHandleA("NIER_FSR4.dll") == nullptr);
-    CHECK(*(void**)(base + 0x4f020) == (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW"));
+    bool bound = *(void**)(base + 0x4f020) == (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW");
+    CHECK(bound);
+    if (!bound)
+    {
+        // e.g. Wine handed back its built-in d3d11.dll: pass the mod under
+        // another name (or set WINEDLLOVERRIDES=d3d11=n,b)
+        printf("     %s is not the patched mod, skipping the stub checks\n", modPath);
+        return nullptr;
+    }
 
     HMODULE r = ((HMODULE (*)(void*))(base + 0x229a0))((void*)0x1234);
     char got[MAX_PATH] = {}, want[MAX_PATH];
@@ -39,6 +49,9 @@ static HMODULE StubTest(const char* modPath, const char* dir)
     CHECK(fn != nullptr);
     if (fn)
     {
+        // v1, no exception/unwind handler, no prolog, no unwind codes
+        const BYTE* ui = (const BYTE*)(imageBase + fn->UnwindData);
+        CHECK(ui[0] == 0x01 && ui[1] == 0 && ui[2] == 0 && ui[3] == 0);
         DWORD64 stack[4] = {0x1122334455667788ull, 0, 0, 0};
         CONTEXT c = {};
         c.Rip = (DWORD64)(base + 0x229a7);
@@ -47,6 +60,13 @@ static HMODULE StubTest(const char* modPath, const char* dir)
         DWORD64 frame = 0;
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fn, &c, &handlerData, &frame, nullptr);
         CHECK(c.Rip == 0x1122334455667788ull && c.Rsp == (DWORD64)stack + 8);
+
+        // and from the first instruction (the lea)
+        CONTEXT c0 = {};
+        c0.Rip = (DWORD64)(base + 0x229a0);
+        c0.Rsp = (DWORD64)stack;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c0.Rip, fn, &c0, &handlerData, &frame, nullptr);
+        CHECK(c0.Rip == 0x1122334455667788ull && c0.Rsp == (DWORD64)stack + 8);
     }
     return r;
 }
