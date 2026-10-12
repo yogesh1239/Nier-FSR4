@@ -3,3 +3,5 @@ build/
 *.dll
 *.exe
 *.pkl
+!third_party/NIER_DLAA/*.dll
+/sdk/
