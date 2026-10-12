@@ -1,0 +1,1 @@
+AMD FSR SDK 2.3.0 (FSR Upscaling 4.1.1), commit 60f4ea81909200d8542eca14dccb2628b763a9a3, https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
